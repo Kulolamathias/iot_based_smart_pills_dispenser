@@ -3,4 +3,8 @@ idf_component_register(
         "src/stepper_motor.c"
     INCLUDE_DIRS 
         "include"
+    REQUIRES 
+        config 
+        utils
+        driver
 )
