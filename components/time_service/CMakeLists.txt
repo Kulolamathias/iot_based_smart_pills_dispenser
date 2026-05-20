@@ -1,9 +1,9 @@
 idf_component_register(
     SRCS 
-        "src/lcd_i2c.c"
+        "src/time_service.c"
     INCLUDE_DIRS 
         "include"
     REQUIRES 
-        driver
         esp_timer
+        lwip
 )

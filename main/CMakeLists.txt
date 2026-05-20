@@ -4,6 +4,8 @@ idf_component_register(
         "main.c"
     PRIV_REQUIRES 
         stepper_motor 
+        time_service
+        nvs_flash
         rtc 
         lcd 
         led 
@@ -15,4 +17,6 @@ idf_component_register(
         scheduler 
         config 
         utils
+        esp_timer
+        esp_netif esp_event time_service
 )
