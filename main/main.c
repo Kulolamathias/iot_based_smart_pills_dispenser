@@ -4,6 +4,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_mac.h"
 #include "driver/i2c.h"
 #include "driver/gpio.h"
 #include "time_service.h"
@@ -11,6 +12,8 @@
 #include "ultrasonic.h"
 #include "stepper_motor.h"
 #include "keypad.h"
+#include "wifi_manager.h"
+#include "mqtt_manager.h"
 
 static const char *TAG = "MAIN";
 
@@ -28,8 +31,8 @@ static const char *TAG = "MAIN";
 #define ULTRASONIC_ECHO_PIN     16
 #define ULTRASONIC_TIMEOUT_US   30000
 
-// ===== Stepper (A4988) =====
-#define STEP_PIN                3
+// ===== Stepper (A4988) – moved STEP to safe pin 17 (avoid GPIO3 strapping) =====
+#define STEP_PIN                17   // was 3 (strapping pin)
 #define DIR_PIN                 4
 #define ENABLE_PIN              5
 #define MS1_PIN                 9
@@ -42,13 +45,62 @@ static const char *TAG = "MAIN";
 #define KEYPAD_ROW_PINS         {1, 2, 42, 41}
 #define KEYPAD_COL_PINS         {40, 39, 38, 37}
 
+// ===== WiFi & MQTT Credentials (from smart bin project) =====
+#define WIFI_SSID               "Mathias' Sxx U..."
+#define WIFI_PASSWORD           "1234567890223"
+#define MQTT_BROKER_URI         "mqtt://102.223.8.140:1883"
+#define MQTT_USERNAME           "mqtt_user"
+#define MQTT_PASSWORD           "ega12345"
+
 static lcd_handle_t *s_lcd = NULL;
 static float s_last_distance = -1.0f;
 static char s_last_time_str[20] = "";
 static int s_last_second = -1;
 
-// Distance measurement callback (runs in timer context, not ISR)
-static void measure_distance_cb(void *arg)
+// Device ID (MAC) will be obtained from wifi_manager or directly
+static char s_device_id[18] = {0};
+
+// MQTT topics base
+static char s_base_topic[64] = {0};
+
+// Forward declarations
+static void update_lcd_time(void);
+static void distance_measure_cb(void *arg);
+static void mqtt_message_handler(const char *topic, const char *payload, void *user_data);
+static void mqtt_connected_cb(void);
+static void wifi_connected_cb(void);
+
+// ===== Utility: get device ID from MAC =====
+static void get_device_id(void)
+{
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    snprintf(s_device_id, sizeof(s_device_id), "%02x%02x%02x%02x%02x%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    snprintf(s_base_topic, sizeof(s_base_topic), "smartpill/dispenser/%s", s_device_id);
+    ESP_LOGI(TAG, "Device ID: %s, base topic: %s", s_device_id, s_base_topic);
+}
+
+// ===== LCD update only when second changes =====
+static void update_lcd_time(void)
+{
+    struct tm now;
+    time_service_get_tm(&now);
+    int current_second = now.tm_sec;
+    if (current_second != s_last_second) {
+        s_last_second = current_second;
+        char time_str[20];
+        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &now);
+        if (strcmp(time_str, s_last_time_str) != 0) {
+            strcpy(s_last_time_str, time_str);
+            lcd_set_cursor(s_lcd, 0, 0);
+            lcd_printf(s_lcd, "Time: %s", time_str);
+        }
+    }
+}
+
+// ===== Distance measurement callback (timer) =====
+static void distance_measure_cb(void *arg)
 {
     float dist = ultrasonic_measure_blocking();
     if (dist != s_last_distance) {
@@ -65,9 +117,39 @@ static void measure_distance_cb(void *arg)
     }
 }
 
+// ===== MQTT message handler =====
+static void mqtt_message_handler(const char *topic, const char *payload, void *user_data)
+{
+    ESP_LOGI(TAG, "MQTT message: %s -> %s", topic, payload);
+    // TODO: parse JSON and handle commands like "dispense_now", "set_schedule"
+    // For now, just log.
+}
+
+// ===== MQTT connected callback: subscribe to command and schedule topics =====
+static void mqtt_connected_cb(void)
+{
+    char topic[128];
+    snprintf(topic, sizeof(topic), "%s/command", s_base_topic);
+    mqtt_manager_subscribe(topic);
+    snprintf(topic, sizeof(topic), "%s/schedule", s_base_topic);
+    mqtt_manager_subscribe(topic);
+    ESP_LOGI(TAG, "Subscribed to %s/command and %s/schedule", s_base_topic, s_base_topic);
+    // Publish online status
+    snprintf(topic, sizeof(topic), "%s/status", s_base_topic);
+    mqtt_manager_publish(topic, "online", true);
+}
+
+// ===== WiFi connected callback: start MQTT =====
+static void wifi_connected_cb(void)
+{
+    ESP_LOGI(TAG, "WiFi connected, starting MQTT");
+    mqtt_manager_start();
+}
+
+// ===== Main =====
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Starting Integrated Test");
+    ESP_LOGI(TAG, "Starting Integrated Pill Dispenser");
 
     // 1. I2C for LCD
     i2c_config_t conf = {
@@ -109,15 +191,13 @@ void app_main(void)
 
     // 4. Ultrasonic
     ESP_ERROR_CHECK(ultrasonic_init(ULTRASONIC_TRIG_PIN, ULTRASONIC_ECHO_PIN, ULTRASONIC_TIMEOUT_US));
-
-    // Start a periodic timer to measure distance every 2 seconds
     const esp_timer_create_args_t timer_args = {
-        .callback = measure_distance_cb,
+        .callback = distance_measure_cb,
         .name = "dist_timer"
     };
     esp_timer_handle_t dist_timer;
     ESP_ERROR_CHECK(esp_timer_create(&timer_args, &dist_timer));
-    ESP_ERROR_CHECK(esp_timer_start_periodic(dist_timer, 2 * 1000 * 1000)); // 2 seconds
+    ESP_ERROR_CHECK(esp_timer_start_periodic(dist_timer, 2 * 1000 * 1000));
 
     // 5. Stepper motor
     stepper_config_t stepper_cfg = {
@@ -139,30 +219,28 @@ void app_main(void)
     ESP_ERROR_CHECK(keypad_init(row_pins, col_pins));
     ESP_ERROR_CHECK(keypad_start());
 
-    // 7. Main loop – only update time when second changes
+    // 7. WiFi & MQTT
+    get_device_id();   // sets s_device_id and s_base_topic
+    wifi_manager_init(WIFI_SSID, WIFI_PASSWORD);
+    wifi_manager_register_connected_cb(wifi_connected_cb);
+
+    mqtt_manager_init(MQTT_BROKER_URI, MQTT_USERNAME, MQTT_PASSWORD);
+    mqtt_manager_register_connected_cb(mqtt_connected_cb);
+    mqtt_manager_register_message_cb(mqtt_message_handler, NULL);
+
+    wifi_manager_start();   // starts WiFi connection; on connect, MQTT will start
+
+    // 8. Main loop: update time, handle keypad, and optionally stepper demo
     char key;
     while (1) {
-        struct tm now;
-        time_service_get_tm(&now);
-        int current_second = now.tm_sec;
-        if (current_second != s_last_second) {
-            s_last_second = current_second;
-            char time_str[20];
-            strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &now);
-            if (strcmp(time_str, s_last_time_str) != 0) {
-                strcpy(s_last_time_str, time_str);
-                lcd_set_cursor(s_lcd, 0, 0);
-                lcd_printf(s_lcd, "Time: %s", time_str);
-            }
-        }
+        update_lcd_time();
 
-        // Check keypad (non‑blocking)
         if (keypad_get_key(&key)) {
             ESP_LOGI(TAG, "Key pressed: %c", key);
             lcd_set_cursor(s_lcd, 3, 0);
             lcd_printf(s_lcd, "Key: %c          ", key);
 
-            // Example: rotate stepper on 'A'
+            // Example: press 'A' to dispense one full rotation
             if (key == 'A') {
                 uint32_t steps_per_rev = 48;
                 switch (MICROSTEP_MODE) {
@@ -172,15 +250,19 @@ void app_main(void)
                     case STEP_EIGHTH:    steps_per_rev *= 8; break;
                     case STEP_SIXTEENTH: steps_per_rev *= 16; break;
                 }
-                ESP_LOGI(TAG, "Rotating stepper %lu steps", steps_per_rev);
+                ESP_LOGI(TAG, "Dispensing: %lu steps", steps_per_rev);
                 stepper_motor_set_direction(true);
                 stepper_motor_rotate_steps(steps_per_rev);
                 vTaskDelay(pdMS_TO_TICKS(500));
                 stepper_motor_set_direction(false);
                 stepper_motor_rotate_steps(steps_per_rev);
+                // Publish log via MQTT
+                char topic[128];
+                snprintf(topic, sizeof(topic), "%s/log", s_base_topic);
+                mqtt_manager_publish(topic, "Dispensed manually (key A)", false);
             }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(50));  // short delay, no LCD flicker
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
