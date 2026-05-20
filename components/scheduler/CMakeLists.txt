@@ -1,1 +1,13 @@
-idf_component_register(SRCS src/scheduler.c INCLUDE_DIRS include)
+idf_component_register(
+    SRCS 
+        "src/scheduler.c"
+    INCLUDE_DIRS 
+        include
+    REQUIRES 
+        time_service 
+        stepper_motor 
+        ultrasonic 
+        wifi_mqtt 
+        nvs_flash 
+        json
+)

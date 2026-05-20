@@ -14,6 +14,7 @@
 #include "keypad.h"
 #include "wifi_manager.h"
 #include "mqtt_manager.h"
+#include "scheduler.h"
 
 static const char *TAG = "MAIN";
 
@@ -45,24 +46,28 @@ static const char *TAG = "MAIN";
 #define KEYPAD_ROW_PINS         {1, 2, 42, 41}
 #define KEYPAD_COL_PINS         {40, 39, 38, 37}
 
-// ========== WiFi & MQTT Credentials (from smart bin project) ==========
+// ========== WiFi & MQTT Credentials ==========
 #define WIFI_SSID               "Mathias' Sxx U..."
 #define WIFI_PASSWORD           "1234567890223"
 #define MQTT_BROKER_URI         "mqtt://102.223.8.140:1883"
 #define MQTT_USERNAME           "mqtt_user"
 #define MQTT_PASSWORD           "ega12345"
 
+// ========== Scheduler Configuration ==========
+// Assuming carousel has 4 chambers; full revolution = 48 steps * 16 microsteps = 768 steps
+#define STEPS_PER_CHAMBER       192      // 768 / 4
+#define HAND_WAIT_TIMEOUT_SEC   10       // seconds to wait for hand after unlocking
+
 static lcd_handle_t *s_lcd = NULL;
 static float s_last_distance = -1.0f;
 static char s_last_time_str[20] = "";
 static int s_last_second = -1;
-static char s_last_key_str[2] = " ";
 
 // ========== Helper: update LCD time (only when second changes) ==========
 static void update_lcd_time(void)
 {
     struct tm now;
-    time_service_get_tm(&now);   // now returns LOCAL time (with offset)
+    time_service_get_tm(&now);   // returns LOCAL time (with offset)
     int current_second = now.tm_sec;
     if (current_second != s_last_second) {
         s_last_second = current_second;
@@ -94,40 +99,20 @@ static void distance_measure_cb(void *arg)
     }
 }
 
-// ========== Manual dispense demo (rotate one full revolution) ==========
-static void manual_dispense(void)
-{
-    uint32_t steps_per_rev = 48;
-    switch (MICROSTEP_MODE) {
-        case STEP_FULL:      steps_per_rev *= 1; break;
-        case STEP_HALF:      steps_per_rev *= 2; break;
-        case STEP_QUARTER:   steps_per_rev *= 4; break;
-        case STEP_EIGHTH:    steps_per_rev *= 8; break;
-        case STEP_SIXTEENTH: steps_per_rev *= 16; break;
-        default: break;
-    }
-    ESP_LOGI(TAG, "Manual dispense: %lu steps", steps_per_rev);
-    stepper_motor_set_direction(true);
-    stepper_motor_rotate_steps(steps_per_rev);
-    vTaskDelay(pdMS_TO_TICKS(500));
-    stepper_motor_set_direction(false);
-    stepper_motor_rotate_steps(steps_per_rev);
-}
-
 // ========== MQTT Callbacks ==========
 static void mqtt_command_cb(const char *action, const char *payload, void *user_data)
 {
     ESP_LOGI(TAG, "MQTT command: action=%s, payload=%s", action, payload);
     if (strcmp(action, "dispense_now") == 0) {
-        manual_dispense();
-        mqtt_manager_publish_log("dispensed", "manual", -1, "manual command");
+        scheduler_dispense_now();
+        mqtt_manager_publish_log("dispensed", "manual", -1, "MQTT command");
     } else if (strcmp(action, "reboot") == 0) {
         ESP_LOGI(TAG, "Rebooting in 1 second...");
         vTaskDelay(pdMS_TO_TICKS(1000));
         esp_restart();
     } else if (strcmp(action, "clear_schedule") == 0) {
-        ESP_LOGI(TAG, "Schedule cleared (not implemented yet)");
-        mqtt_manager_publish_log("schedule_updated", NULL, -1, "cleared");
+        scheduler_clear();
+        mqtt_manager_publish_log("schedule_updated", NULL, -1, "cleared by command");
     } else {
         ESP_LOGW(TAG, "Unknown action: %s", action);
     }
@@ -136,8 +121,14 @@ static void mqtt_command_cb(const char *action, const char *payload, void *user_
 static void mqtt_schedule_cb(const char *schedule_json, void *user_data)
 {
     ESP_LOGI(TAG, "New schedule received: %s", schedule_json);
-    // TODO: parse and store schedule in NVS, compute next dose times
-    mqtt_manager_publish_log("schedule_updated", NULL, -1, "schedule received");
+    ESP_LOG_BUFFER_HEXDUMP(TAG, schedule_json, strlen(schedule_json), ESP_LOG_INFO);
+    esp_err_t ret = scheduler_set_schedule(schedule_json);
+    if (ret == ESP_OK) {
+        mqtt_manager_publish_log("schedule_updated", NULL, -1, "schedule stored");
+    } else {
+        ESP_LOGE(TAG, "Failed to parse schedule");
+        mqtt_manager_publish_log("error", NULL, -1, "invalid schedule JSON");
+    }
 }
 
 static void mqtt_connected_cb(void)
@@ -148,7 +139,7 @@ static void mqtt_connected_cb(void)
 
 static void wifi_connected_cb(void)
 {
-    ESP_LOGI(TAG, "WiFi connected, starting MQTT");
+    ESP_LOGI(TAG, "WiFi connected, starting MQTT and NTP sync");
     mqtt_manager_start();
     time_service_sync_ntp();
 }
@@ -156,7 +147,7 @@ static void wifi_connected_cb(void)
 // ========== Main ==========
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Starting Integrated Pill Dispenser");
+    ESP_LOGI(TAG, "Starting Integrated Pill Dispenser with Scheduler");
 
     // ---------- 1. I2C for LCD ----------
     i2c_config_t conf = {
@@ -173,6 +164,7 @@ void app_main(void)
     // ---------- 2. Software RTC ----------
     ESP_ERROR_CHECK(time_service_init());
     time_service_set_timezone(3);   // Tanzania (UTC+3)
+    // Set initial dummy time (will be updated by NTP when WiFi connects)
     struct tm init_tm = {
         .tm_year = 126, .tm_mon = 4, .tm_mday = 20,
         .tm_hour = 12, .tm_min = 0, .tm_sec = 0
@@ -244,27 +236,38 @@ void app_main(void)
     mqtt_manager_register_command_cb(mqtt_command_cb, NULL);
     mqtt_manager_register_schedule_cb(mqtt_schedule_cb, NULL);
 
-    // ---------- 8. Main loop ----------
+    // ---------- 8. Scheduler ----------
+    ESP_ERROR_CHECK(scheduler_init(STEPS_PER_CHAMBER, HAND_WAIT_TIMEOUT_SEC));
+    ESP_LOGI(TAG, "Scheduler initialised with %d steps/chamber, hand wait %d sec",
+             STEPS_PER_CHAMBER, HAND_WAIT_TIMEOUT_SEC);
+
+    // ---------- 9. Main loop ----------
     char key;
     while (1) {
         // Update LCD time (only when second changes)
         update_lcd_time();
 
+        // Show number of pending doses on LCD line 3 (optional)
+        int pending = scheduler_get_pending_count();
+        lcd_set_cursor(s_lcd, 3, 0);
+        lcd_printf(s_lcd, "Pending: %d    ", pending);
+
         // Check keypad
         if (keypad_get_key(&key)) {
             ESP_LOGI(TAG, "Key pressed: %c", key);
-            s_last_key_str[0] = key;
-            s_last_key_str[1] = '\0';
             lcd_set_cursor(s_lcd, 3, 0);
             lcd_printf(s_lcd, "Key: %c          ", key);
-            // Option: if key 'A' triggers manual dispense
+            vTaskDelay(pdMS_TO_TICKS(500)); // show key for 0.5 sec
+            lcd_set_cursor(s_lcd, 3, 0);
+            lcd_printf(s_lcd, "Pending: %d    ", pending); // restore pending count
+
+            // If key 'A' is pressed, manually dispense
             if (key == 'A') {
-                manual_dispense();
+                scheduler_dispense_now();
                 mqtt_manager_publish_log("dispensed", "manual", -1, "key A");
             }
         }
 
-        // Short delay to keep system responsive
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
