@@ -62,7 +62,7 @@ static char s_last_key_str[2] = " ";
 static void update_lcd_time(void)
 {
     struct tm now;
-    time_service_get_tm(&now);
+    time_service_get_tm(&now);   // now returns LOCAL time (with offset)
     int current_second = now.tm_sec;
     if (current_second != s_last_second) {
         s_last_second = current_second;
@@ -71,7 +71,7 @@ static void update_lcd_time(void)
         if (strcmp(time_str, s_last_time_str) != 0) {
             strcpy(s_last_time_str, time_str);
             lcd_set_cursor(s_lcd, 0, 0);
-            lcd_printf(s_lcd, "Time: %s", time_str);
+            lcd_printf(s_lcd, "%s", time_str);   // no prefix
         }
     }
 }
@@ -150,6 +150,7 @@ static void wifi_connected_cb(void)
 {
     ESP_LOGI(TAG, "WiFi connected, starting MQTT");
     mqtt_manager_start();
+    time_service_sync_ntp();
 }
 
 // ========== Main ==========
@@ -171,6 +172,7 @@ void app_main(void)
 
     // ---------- 2. Software RTC ----------
     ESP_ERROR_CHECK(time_service_init());
+    time_service_set_timezone(3);   // Tanzania (UTC+3)
     struct tm init_tm = {
         .tm_year = 126, .tm_mon = 4, .tm_mday = 20,
         .tm_hour = 12, .tm_min = 0, .tm_sec = 0
