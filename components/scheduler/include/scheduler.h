@@ -12,7 +12,7 @@ extern "C" {
  * @brief Initialize the scheduler (load schedule from NVS, start checking timer)
  * 
  * @param steps_per_chamber Number of stepper motor steps to advance one chamber
- * @param hand_wait_timeout_sec Maximum seconds to wait for hand after unlocking
+ * @param hand_wait_timeout_sec Seconds between reminder logs while waiting for hand
  * @return ESP_OK on success
  */
 esp_err_t scheduler_init(uint32_t steps_per_chamber, uint32_t hand_wait_timeout_sec);

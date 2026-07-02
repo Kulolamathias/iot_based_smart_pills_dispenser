@@ -13,6 +13,8 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdbool.h>
+#include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -64,7 +66,7 @@ static const char *TAG = "MAIN";
 #define MOTOR_FULL_STEPS_PER_REV 200
 #define CAROUSEL_CHAMBERS       20
 #define STEPS_PER_CHAMBER       (MOTOR_FULL_STEPS_PER_REV / CAROUSEL_CHAMBERS)
-#define HAND_WAIT_TIMEOUT_SEC   10       /* Seconds to wait for hand */
+#define HAND_WAIT_REMINDER_SEC  10       /* LCD/log reminder interval while waiting for hand */
 
 /* ========================================================================= */
 /* Global variables used by scheduler                                       */
@@ -75,6 +77,30 @@ SemaphoreHandle_t s_lcd_mutex = NULL;
 static float s_last_distance = -1.0f;
 static char s_last_time_str[20] = "";
 static int s_last_second = -1;
+
+typedef enum {
+    LOCAL_UI_IDLE = 0,
+    LOCAL_UI_MED_SLOT,
+    LOCAL_UI_TIME,
+    LOCAL_UI_DOSE_COUNT,
+    LOCAL_UI_CONFIRM,
+    LOCAL_UI_DONE
+} local_ui_state_t;
+
+typedef struct {
+    local_ui_state_t state;
+    char input[8];
+    size_t input_len;
+    int med_slot;
+    int hour;
+    int minute;
+    int dose_count;
+    int message_ticks;
+} local_schedule_ui_t;
+
+static local_schedule_ui_t s_local_ui = {
+    .state = LOCAL_UI_IDLE
+};
 
 /* ========================================================================= */
 /* Helper: update LCD time (only when second changes)                       */
@@ -98,12 +124,253 @@ static void update_lcd_time(void)
     }
 }
 
+static void lcd_line(uint8_t row, const char *text)
+{
+    if (!s_lcd || !s_lcd_mutex) return;
+
+    xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
+    lcd_set_cursor(s_lcd, row, 0);
+    lcd_printf(s_lcd, "%-20.20s", text);
+    xSemaphoreGive(s_lcd_mutex);
+}
+
+static void local_ui_clear_input(void)
+{
+    s_local_ui.input_len = 0;
+    s_local_ui.input[0] = '\0';
+}
+
+static void local_ui_show(void)
+{
+    char line[32];
+
+    switch (s_local_ui.state) {
+        case LOCAL_UI_MED_SLOT:
+            lcd_line(0, "Register dose");
+            lcd_line(1, "Medicine slot 01-20");
+            snprintf(line, sizeof(line), "Slot: %s_", s_local_ui.input);
+            lcd_line(2, line);
+            lcd_line(3, "#=OK *=Cancel");
+            break;
+
+        case LOCAL_UI_TIME:
+            lcd_line(0, "Dose time");
+            lcd_line(1, "Enter HHMM 24-hour");
+            snprintf(line, sizeof(line), "Time: %s_", s_local_ui.input);
+            lcd_line(2, line);
+            lcd_line(3, "#=OK B=Back");
+            break;
+
+        case LOCAL_UI_DOSE_COUNT:
+            lcd_line(0, "How many doses?");
+            lcd_line(1, "Usually chambers used");
+            snprintf(line, sizeof(line), "Count: %s_", s_local_ui.input);
+            lcd_line(2, line);
+            lcd_line(3, "#=OK B=Back");
+            break;
+
+        case LOCAL_UI_CONFIRM:
+            lcd_line(0, "Confirm schedule");
+            snprintf(line, sizeof(line), "MED%02d %02d:%02d", s_local_ui.med_slot,
+                     s_local_ui.hour, s_local_ui.minute);
+            lcd_line(1, line);
+            snprintf(line, sizeof(line), "%d daily dose(s)", s_local_ui.dose_count);
+            lcd_line(2, line);
+            lcd_line(3, "A=Save B=Back *=No");
+            break;
+
+        case LOCAL_UI_DONE:
+            lcd_line(0, "Local schedule");
+            lcd_line(1, "Saved successfully");
+            lcd_line(2, "Works offline now");
+            lcd_line(3, "Returning...");
+            break;
+
+        case LOCAL_UI_IDLE:
+        default:
+            break;
+    }
+}
+
+static void local_ui_start(void)
+{
+    memset(&s_local_ui, 0, sizeof(s_local_ui));
+    s_local_ui.state = LOCAL_UI_MED_SLOT;
+    local_ui_show();
+}
+
+static void local_ui_cancel(void)
+{
+    memset(&s_local_ui, 0, sizeof(s_local_ui));
+    lcd_line(0, "Local schedule");
+    lcd_line(1, "Cancelled");
+    lcd_line(2, "");
+    lcd_line(3, "");
+    vTaskDelay(pdMS_TO_TICKS(800));
+}
+
+static bool local_ui_add_digit(char key, size_t max_len)
+{
+    if (key < '0' || key > '9') return false;
+    if (s_local_ui.input_len >= max_len) return false;
+
+    s_local_ui.input[s_local_ui.input_len++] = key;
+    s_local_ui.input[s_local_ui.input_len] = '\0';
+    return true;
+}
+
+static int local_ui_input_int(void)
+{
+    if (s_local_ui.input_len == 0) return -1;
+    return atoi(s_local_ui.input);
+}
+
+static void local_ui_save_schedule(void)
+{
+    struct tm now;
+    char json[192];
+    esp_err_t ret;
+
+    time_service_get_tm(&now);
+    snprintf(json, sizeof(json),
+             "[{\"name\":\"MED%02d\",\"times\":[\"%02d:%02d\"],"
+             "\"duration_days\":%d,\"total_pills\":%d,"
+             "\"start_date\":\"%04d-%02d-%02d\"}]",
+             s_local_ui.med_slot,
+             s_local_ui.hour,
+             s_local_ui.minute,
+             s_local_ui.dose_count + 1,
+             s_local_ui.dose_count,
+             now.tm_year + 1900,
+             now.tm_mon + 1,
+             now.tm_mday);
+
+    ret = scheduler_set_schedule(json);
+    if (ret == ESP_OK) {
+        mqtt_manager_publish_log("schedule_updated", NULL, -1, "saved from keypad");
+        s_local_ui.state = LOCAL_UI_DONE;
+        s_local_ui.message_ticks = 20;
+        local_ui_show();
+    } else {
+        lcd_line(0, "Save failed");
+        lcd_line(1, "Try again");
+        lcd_line(2, "");
+        lcd_line(3, "B=Back *=Cancel");
+    }
+}
+
+static bool local_ui_handle_key(char key)
+{
+    int value;
+
+    if (s_local_ui.state == LOCAL_UI_IDLE) return false;
+
+    if (key == '*') {
+        local_ui_cancel();
+        return true;
+    }
+
+    switch (s_local_ui.state) {
+        case LOCAL_UI_MED_SLOT:
+            if (local_ui_add_digit(key, 2)) {
+                local_ui_show();
+            } else if (key == '#') {
+                value = local_ui_input_int();
+                if (value >= 1 && value <= CAROUSEL_CHAMBERS) {
+                    s_local_ui.med_slot = value;
+                    local_ui_clear_input();
+                    s_local_ui.state = LOCAL_UI_TIME;
+                } else {
+                    lcd_line(2, "Use 01 to 20");
+                    vTaskDelay(pdMS_TO_TICKS(700));
+                }
+                local_ui_show();
+            }
+            break;
+
+        case LOCAL_UI_TIME:
+            if (local_ui_add_digit(key, 4)) {
+                local_ui_show();
+            } else if (key == 'B') {
+                local_ui_clear_input();
+                s_local_ui.state = LOCAL_UI_MED_SLOT;
+                local_ui_show();
+            } else if (key == '#') {
+                if (s_local_ui.input_len == 4) {
+                    int hh = (s_local_ui.input[0] - '0') * 10 + (s_local_ui.input[1] - '0');
+                    int mm = (s_local_ui.input[2] - '0') * 10 + (s_local_ui.input[3] - '0');
+                    if (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
+                        s_local_ui.hour = hh;
+                        s_local_ui.minute = mm;
+                        local_ui_clear_input();
+                        s_local_ui.state = LOCAL_UI_DOSE_COUNT;
+                    } else {
+                        lcd_line(2, "Invalid time");
+                        vTaskDelay(pdMS_TO_TICKS(700));
+                    }
+                } else {
+                    lcd_line(2, "Need 4 digits");
+                    vTaskDelay(pdMS_TO_TICKS(700));
+                }
+                local_ui_show();
+            }
+            break;
+
+        case LOCAL_UI_DOSE_COUNT:
+            if (local_ui_add_digit(key, 2)) {
+                local_ui_show();
+            } else if (key == 'B') {
+                local_ui_clear_input();
+                s_local_ui.state = LOCAL_UI_TIME;
+                local_ui_show();
+            } else if (key == '#') {
+                value = local_ui_input_int();
+                if (value >= 1 && value <= CAROUSEL_CHAMBERS) {
+                    s_local_ui.dose_count = value;
+                    local_ui_clear_input();
+                    s_local_ui.state = LOCAL_UI_CONFIRM;
+                } else {
+                    lcd_line(2, "Use 01 to 20");
+                    vTaskDelay(pdMS_TO_TICKS(700));
+                }
+                local_ui_show();
+            }
+            break;
+
+        case LOCAL_UI_CONFIRM:
+            if (key == 'A' || key == '#') {
+                local_ui_save_schedule();
+            } else if (key == 'B') {
+                s_local_ui.state = LOCAL_UI_DOSE_COUNT;
+                local_ui_clear_input();
+                local_ui_show();
+            }
+            break;
+
+        case LOCAL_UI_DONE:
+            break;
+
+        case LOCAL_UI_IDLE:
+        default:
+            break;
+    }
+
+    return true;
+}
+
+static bool local_ui_active(void)
+{
+    return s_local_ui.state != LOCAL_UI_IDLE;
+}
+
 /* ========================================================================= */
 /* Distance measurement callback (called by timer every 2 seconds)          */
 /* ========================================================================= */
 static void distance_measure_cb(void *arg)
 {
     (void)arg;
+    if (local_ui_active()) return;
+
     float dist = ultrasonic_measure_blocking();
     if (dist != s_last_distance) {
         s_last_distance = dist;
@@ -279,25 +546,45 @@ void app_main(void)
     mqtt_manager_register_schedule_cb(mqtt_schedule_cb, NULL);
 
     /* 8. Scheduler */
-    ESP_ERROR_CHECK(scheduler_init(STEPS_PER_CHAMBER, HAND_WAIT_TIMEOUT_SEC));
-    ESP_LOGI(TAG, "Scheduler initialised: %d steps/chamber, %d sec hand wait",
-             STEPS_PER_CHAMBER, HAND_WAIT_TIMEOUT_SEC);
+    ESP_ERROR_CHECK(scheduler_init(STEPS_PER_CHAMBER, HAND_WAIT_REMINDER_SEC));
+    ESP_LOGI(TAG, "Scheduler initialised: %d steps/chamber, %d sec hand reminder",
+             STEPS_PER_CHAMBER, HAND_WAIT_REMINDER_SEC);
 
     /* 9. Main loop */
     char key;
     while (1) {
-        update_lcd_time();
+        if (s_local_ui.state == LOCAL_UI_DONE) {
+            if (s_local_ui.message_ticks > 0) {
+                s_local_ui.message_ticks--;
+            } else {
+                memset(&s_local_ui, 0, sizeof(s_local_ui));
+                lcd_clear(s_lcd);
+                lcd_printf(s_lcd, "Pill Dispenser");
+                lcd_set_cursor(s_lcd, 1, 0);
+                lcd_printf(s_lcd, "System Ready");
+            }
+        }
 
-        /* Update pending dose count on LCD line 3 */
-        int pending = scheduler_get_pending_count();
-        xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
-        lcd_set_cursor(s_lcd, 3, 0);
-        lcd_printf(s_lcd, "Pending: %d    ", pending);
-        xSemaphoreGive(s_lcd_mutex);
+        if (!local_ui_active()) {
+            update_lcd_time();
+
+            /* Update pending dose count on LCD line 3 */
+            int pending = scheduler_get_pending_count();
+            xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
+            lcd_set_cursor(s_lcd, 3, 0);
+            lcd_printf(s_lcd, "Pending: %d    ", pending);
+            xSemaphoreGive(s_lcd_mutex);
+        }
 
         /* Check for keypad input */
         if (keypad_get_key(&key)) {
             ESP_LOGI(TAG, "Key pressed: %c", key);
+
+            if (local_ui_handle_key(key)) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+                continue;
+            }
+
             /* Show key momentarily */
             xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
             lcd_set_cursor(s_lcd, 3, 0);
@@ -311,6 +598,8 @@ void app_main(void)
                 scheduler_calibration_move_steps(STEPS_PER_CHAMBER);
             } else if (key == 'C') {
                 scheduler_calibration_move_steps(MOTOR_FULL_STEPS_PER_REV);
+            } else if (key == 'D') {
+                local_ui_start();
             }
         }
 

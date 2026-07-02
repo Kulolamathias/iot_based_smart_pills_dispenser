@@ -44,8 +44,8 @@ static const char *TAG = "SCHEDULER";
 /* Tanzania timezone offset (UTC+3) in seconds */
 #define TZ_OFFSET_SEC   (3 * 3600)
 
-/* Hand detection distance threshold (cm) */
-#define HAND_DETECT_CM  15.0f
+/* Hand must be very close to the outlet before the carousel advances. */
+#define HAND_DETECT_CM  7.0f
 
 /* Physical carousel layout */
 #define CAROUSEL_CHAMBERS 20
@@ -54,7 +54,7 @@ static const char *TAG = "SCHEDULER";
 /* Static variables – configuration and state                               */
 /* ------------------------------------------------------------------------- */
 static uint32_t s_steps_per_chamber = 0;      /* Steps to advance one chamber */
-static uint32_t s_hand_wait_sec = 0;          /* Seconds to wait for hand */
+static uint32_t s_hand_wait_sec = 0;          /* Reminder log interval while waiting for hand */
 static uint8_t s_current_chamber = 0;
 
 typedef struct {
@@ -297,96 +297,93 @@ static int generate_doses_from_json(const char *json)
 /* ------------------------------------------------------------------------- */
 static void dispense_medicine(const dose_t *dose)
 {
-    /* Show guidance on LCD */
+    esp_err_t step_ret;
+
     if (s_lcd && s_lcd_mutex) {
         xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
         lcd_set_cursor(s_lcd, 2, 0);
         lcd_printf(s_lcd, "Take %s            ", dose->medicine);
         lcd_set_cursor(s_lcd, 3, 0);
-        lcd_printf(s_lcd, "Place hand near    ");
+        lcd_printf(s_lcd, "Hand <= 7cm        ");
         xSemaphoreGive(s_lcd_mutex);
     }
 
-    /* 1. Unlock (placeholder) */
     ESP_LOGI(TAG, "Unlocking bin...");
+    ESP_LOGI(TAG, "Dose due: waiting for hand within %.1f cm to dispense %s",
+             HAND_DETECT_CM, dose->medicine);
 
-    /* 2. Wait for hand detection (ultrasonic distance < threshold) */
-    ESP_LOGI(TAG, "Waiting for hand to take %s", dose->medicine);
-    int64_t start_time = esp_timer_get_time();
-    bool hand_detected = false;
-    while ((esp_timer_get_time() - start_time) < (s_hand_wait_sec * 1000000LL)) {
+    int64_t last_feedback_time = 0;
+    while (true) {
         float dist = ultrasonic_measure_blocking();
-        if (dist > 0.1f && dist < HAND_DETECT_CM) {
-            hand_detected = true;
+        if (dist > 0.1f && dist <= HAND_DETECT_CM) {
             ESP_LOGI(TAG, "Hand detected at %.1f cm", dist);
             break;
         }
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
 
-    if (hand_detected) {
-        /* 3. Rotate stepper by one chamber */
-        stepper_motor_set_direction(true);
-        esp_err_t step_ret = stepper_motor_rotate_steps(s_steps_per_chamber);
-        if (step_ret != ESP_OK) {
-            ESP_LOGE(TAG, "Stepper failed while dispensing %s: %s",
-                     dose->medicine, esp_err_to_name(step_ret));
-            mqtt_manager_publish_log("error", dose->medicine,
-                                     dose->remaining_pills, "stepper failed");
+        int64_t now_us = esp_timer_get_time();
+        if ((now_us - last_feedback_time) >= (s_hand_wait_sec * 1000000LL)) {
+            last_feedback_time = now_us;
+            if (dist > 0.1f) {
+                ESP_LOGI(TAG, "Still waiting for hand: %.1f cm, need <= %.1f cm",
+                         dist, HAND_DETECT_CM);
+            } else {
+                ESP_LOGI(TAG, "Still waiting for hand: ultrasonic out of range");
+            }
+
             if (s_lcd && s_lcd_mutex) {
                 xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
                 lcd_set_cursor(s_lcd, 2, 0);
-                lcd_printf(s_lcd, "Motor error       ");
+                lcd_printf(s_lcd, "Dose ready        ");
                 lcd_set_cursor(s_lcd, 3, 0);
-                lcd_printf(s_lcd, "Dose not moved    ");
+                lcd_printf(s_lcd, "Hand <= 7cm       ");
                 xSemaphoreGive(s_lcd_mutex);
             }
-            vTaskDelay(pdMS_TO_TICKS(2000));
-            return;
         }
 
-        s_current_chamber = (s_current_chamber + 1) % CAROUSEL_CHAMBERS;
-        save_chamber_to_nvs();
-        ESP_LOGI(TAG, "Dispensed %s, next chamber=%u", dose->medicine, s_current_chamber);
-
-        /* 4. Relock (placeholder) */
-        ESP_LOGI(TAG, "Relocking bin");
-
-        /* 5. Publish log via MQTT */
-        mqtt_manager_publish_log("dispensed", dose->medicine,
-                                 dose->remaining_pills - 1, "auto");
-
-        /* Show success on LCD */
-        if (s_lcd && s_lcd_mutex) {
-            xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
-            lcd_set_cursor(s_lcd, 2, 0);
-            lcd_printf(s_lcd, "Dispensed %s      ", dose->medicine);
-            lcd_set_cursor(s_lcd, 3, 0);
-            lcd_printf(s_lcd, "Thank you!        ");
-            xSemaphoreGive(s_lcd_mutex);
-        }
-    } else {
-        /* Timeout – no hand */
-        ESP_LOGW(TAG, "Hand not detected, dose missed");
-        mqtt_manager_publish_log("missed", dose->medicine,
-                                 dose->remaining_pills, "hand timeout");
-
-        if (s_lcd && s_lcd_mutex) {
-            xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
-            lcd_set_cursor(s_lcd, 2, 0);
-            lcd_printf(s_lcd, "Missed dose!      ");
-            lcd_set_cursor(s_lcd, 3, 0);
-            lcd_printf(s_lcd, "Take later        ");
-            xSemaphoreGive(s_lcd_mutex);
-        }
+        vTaskDelay(pdMS_TO_TICKS(150));
     }
 
-    /* Brief delay to let the user read the message, then restore normal display */
+    stepper_motor_set_direction(true);
+    step_ret = stepper_motor_rotate_steps(s_steps_per_chamber);
+    if (step_ret != ESP_OK) {
+        ESP_LOGE(TAG, "Stepper failed while dispensing %s: %s",
+                 dose->medicine, esp_err_to_name(step_ret));
+        mqtt_manager_publish_log("error", dose->medicine,
+                                 dose->remaining_pills, "stepper failed");
+        if (s_lcd && s_lcd_mutex) {
+            xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
+            lcd_set_cursor(s_lcd, 2, 0);
+            lcd_printf(s_lcd, "Motor error       ");
+            lcd_set_cursor(s_lcd, 3, 0);
+            lcd_printf(s_lcd, "Dose not moved    ");
+            xSemaphoreGive(s_lcd_mutex);
+        }
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        return;
+    }
+
+    s_current_chamber = (s_current_chamber + 1) % CAROUSEL_CHAMBERS;
+    save_chamber_to_nvs();
+    ESP_LOGI(TAG, "Dispensed %s, next chamber=%u", dose->medicine, s_current_chamber);
+
+    ESP_LOGI(TAG, "Relocking bin");
+    mqtt_manager_publish_log("dispensed", dose->medicine,
+                             dose->remaining_pills - 1, "auto");
+
+    if (s_lcd && s_lcd_mutex) {
+        xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
+        lcd_set_cursor(s_lcd, 2, 0);
+        lcd_printf(s_lcd, "Dispensed %s      ", dose->medicine);
+        lcd_set_cursor(s_lcd, 3, 0);
+        lcd_printf(s_lcd, "Thank you!        ");
+        xSemaphoreGive(s_lcd_mutex);
+    }
+
     vTaskDelay(pdMS_TO_TICKS(2000));
 }
 
 /* ------------------------------------------------------------------------- */
-/* Timer callback – checks every 60 seconds for due doses.                  */
+/* Timer callback - checks every 60 seconds for due doses.                  */
 /* ------------------------------------------------------------------------- */
 static void check_timer_cb(void *arg)
 {
