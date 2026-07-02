@@ -7,6 +7,8 @@
 #include "nvs_flash.h"
 #include <string.h>
 
+// #define CONFIG_WIFI_SSID "Kylianmbappe"         // Default SSID (can be overridden by Kconfig)
+// #define CONFIG_WIFI_PASSWORD "kylianmbappe" // Default password (can be overridden by Kconfig)
 #define CONFIG_WIFI_SSID "Mathias' Sxx U..."         // Default SSID (can be overridden by Kconfig)
 #define CONFIG_WIFI_PASSWORD "1234567890223" // Default password (can be overridden by Kconfig)
 

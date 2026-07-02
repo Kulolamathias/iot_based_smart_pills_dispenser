@@ -13,8 +13,8 @@
 
 static const char *TAG = "ULTRASONIC";
 
-static gpio_num_t s_trig_pin = GPIO_NUM_NC;
-static gpio_num_t s_echo_pin = GPIO_NUM_NC;
+static gpio_num_t s_trig_pin = 18;
+static gpio_num_t s_echo_pin = 8;
 static uint32_t s_timeout_us = 30000;
 static bool s_initialized = false;
 

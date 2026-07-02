@@ -10,4 +10,5 @@ idf_component_register(
         wifi_mqtt 
         nvs_flash 
         json
+        lcd
 )
