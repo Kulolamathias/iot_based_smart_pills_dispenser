@@ -32,30 +32,6 @@
 
 static const char *TAG = "MAIN";
 
-// /* ========================================================================= */
-// /* Hardware pin definitions (adjust to your wiring)                         */
-// /* ========================================================================= */
-// #define I2C_MASTER_SCL_IO      7
-// #define I2C_MASTER_SDA_IO      6
-// #define I2C_MASTER_NUM         I2C_NUM_0
-// #define I2C_MASTER_FREQ_HZ     100000
-// #define LCD_I2C_ADDR            0x27
-// #define LCD_COLS                20
-// #define LCD_ROWS                4
-
-// #define ULTRASONIC_TRIG_PIN     15
-// #define ULTRASONIC_ECHO_PIN     16
-// #define ULTRASONIC_TIMEOUT_US   30000
-
-// #define STEP_PIN                17
-// #define DIR_PIN                 4
-// #define ENABLE_PIN              5
-// #define MS1_PIN                 9
-// #define MS2_PIN                 10
-// #define MS3_PIN                 11
-// #define MICROSTEP_MODE          STEP_SIXTEENTH
-// #define STEP_DELAY_US           1000
-
 /* ========================================================================= */
 /* Hardware pin definitions (adjust to your wiring)                         */
 /* ========================================================================= */
@@ -74,11 +50,7 @@ static const char *TAG = "MAIN";
 #define STEP_PIN                5
 #define DIR_PIN                 4
 #define ENABLE_PIN              21
-#define MS1_PIN                 17
-#define MS2_PIN                 16
-#define MS3_PIN                 15
-#define MICROSTEP_MODE          STEP_SIXTEENTH
-#define STEP_DELAY_US           1000
+#define STEP_DELAY_US           8000
 
 #define KEYPAD_ROW_PINS         {1, 2, 42, 41}
 #define KEYPAD_COL_PINS         {40, 39, 38, 3}
@@ -89,7 +61,9 @@ static const char *TAG = "MAIN";
 #define MQTT_USERNAME           "mqtt_user"
 #define MQTT_PASSWORD           "ega12345"
 
-#define STEPS_PER_CHAMBER       192      /* One chamber advance */
+#define MOTOR_FULL_STEPS_PER_REV 200
+#define CAROUSEL_CHAMBERS       20
+#define STEPS_PER_CHAMBER       (MOTOR_FULL_STEPS_PER_REV / CAROUSEL_CHAMBERS)
 #define HAND_WAIT_TIMEOUT_SEC   10       /* Seconds to wait for hand */
 
 /* ========================================================================= */
@@ -154,7 +128,10 @@ static void mqtt_command_cb(const char *action, const char *payload, void *user_
     ESP_LOGI(TAG, "MQTT command: action=%s", action);
     if (strcmp(action, "dispense_now") == 0) {
         scheduler_dispense_now();
-        mqtt_manager_publish_log("dispensed", "manual", -1, "MQTT command");
+    } else if (strcmp(action, "advance_chamber") == 0) {
+        scheduler_calibration_move_steps(STEPS_PER_CHAMBER);
+    } else if (strcmp(action, "motor_rev_test") == 0) {
+        scheduler_calibration_move_steps(MOTOR_FULL_STEPS_PER_REV);
     } else if (strcmp(action, "reboot") == 0) {
         ESP_LOGI(TAG, "Rebooting in 1 second...");
         vTaskDelay(pdMS_TO_TICKS(1000));
@@ -277,15 +254,12 @@ void app_main(void)
         .step_pin = STEP_PIN,
         .dir_pin = DIR_PIN,
         .enable_pin = ENABLE_PIN,
-        .ms1_pin = MS1_PIN,
-        .ms2_pin = MS2_PIN,
-        .ms3_pin = MS3_PIN,
-        .microstep = MICROSTEP_MODE,
         .step_delay_us = STEP_DELAY_US,
-        .enable_on_init = true
+        .enable_on_init = false
     };
     ESP_ERROR_CHECK(stepper_motor_init(&stepper_cfg));
-    ESP_LOGI(TAG, "Stepper motor initialised");
+    ESP_LOGI(TAG, "Stepper motor initialised: %d full steps/rev, %d chambers, %d steps/chamber",
+             MOTOR_FULL_STEPS_PER_REV, CAROUSEL_CHAMBERS, STEPS_PER_CHAMBER);
 
     /* 6. Keypad */
     gpio_num_t row_pins[4] = KEYPAD_ROW_PINS;
@@ -333,7 +307,10 @@ void app_main(void)
 
             if (key == 'A') {
                 scheduler_dispense_now();
-                mqtt_manager_publish_log("dispensed", "manual", -1, "key A");
+            } else if (key == 'B') {
+                scheduler_calibration_move_steps(STEPS_PER_CHAMBER);
+            } else if (key == 'C') {
+                scheduler_calibration_move_steps(MOTOR_FULL_STEPS_PER_REV);
             }
         }
 

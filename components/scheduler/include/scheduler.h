@@ -39,6 +39,16 @@ void scheduler_clear(void);
 void scheduler_dispense_now(void);
 
 /**
+ * @brief Move the carousel by raw full steps for calibration/testing.
+ *
+ * This bypasses hand detection and schedules. It is intended for mechanical
+ * calibration only.
+ *
+ * @param steps Number of full steps to move clockwise.
+ */
+void scheduler_calibration_move_steps(uint32_t steps);
+
+/**
  * @brief Get number of pending doses (not yet taken)
  */
 int scheduler_get_pending_count(void);

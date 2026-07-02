@@ -24,7 +24,9 @@
 #include "esp_timer.h"
 #include "cJSON.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -34,6 +36,7 @@ static const char *TAG = "SCHEDULER";
 /* NVS storage keys */
 #define NVS_NAMESPACE   "scheduler"
 #define NVS_KEY_SCHEDULE "schedule_json"
+#define NVS_KEY_CHAMBER  "chamber_index"
 
 /* Maximum number of dose events that can be stored */
 #define MAX_DOSES 100
@@ -44,11 +47,15 @@ static const char *TAG = "SCHEDULER";
 /* Hand detection distance threshold (cm) */
 #define HAND_DETECT_CM  15.0f
 
+/* Physical carousel layout */
+#define CAROUSEL_CHAMBERS 20
+
 /* ------------------------------------------------------------------------- */
 /* Static variables – configuration and state                               */
 /* ------------------------------------------------------------------------- */
 static uint32_t s_steps_per_chamber = 0;      /* Steps to advance one chamber */
 static uint32_t s_hand_wait_sec = 0;          /* Seconds to wait for hand */
+static uint8_t s_current_chamber = 0;
 
 typedef struct {
     time_t timestamp;           /* UTC timestamp of the dose */
@@ -61,10 +68,15 @@ static int s_dose_count = 0;
 static bool s_initialized = false;
 static esp_timer_handle_t s_check_timer = NULL;
 static bool s_dispensing_in_progress = false;
+static SemaphoreHandle_t s_scheduler_mutex = NULL;
+static QueueHandle_t s_dispense_queue = NULL;
 
 /* External LCD handle and mutex (set from main.c) */
 extern lcd_handle_t *s_lcd;
 extern SemaphoreHandle_t s_lcd_mutex;
+
+static bool queue_next_dose_for_dispense(bool require_due_time);
+static void dispense_task(void *arg);
 
 /* ------------------------------------------------------------------------- */
 /* Helper: convert year, month, day, hour, minute, second to UTC timestamp   */
@@ -136,6 +148,28 @@ static char* load_schedule_from_nvs(void)
     }
     nvs_close(nvs);
     return buf;
+}
+
+static void save_chamber_to_nvs(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+        nvs_set_u8(nvs, NVS_KEY_CHAMBER, s_current_chamber);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+}
+
+static void load_chamber_from_nvs(void)
+{
+    nvs_handle_t nvs;
+    uint8_t chamber = 0;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
+        if (nvs_get_u8(nvs, NVS_KEY_CHAMBER, &chamber) == ESP_OK && chamber < CAROUSEL_CHAMBERS) {
+            s_current_chamber = chamber;
+        }
+        nvs_close(nvs);
+    }
 }
 
 /* ------------------------------------------------------------------------- */
@@ -263,12 +297,6 @@ static int generate_doses_from_json(const char *json)
 /* ------------------------------------------------------------------------- */
 static void dispense_medicine(const dose_t *dose)
 {
-    if (s_dispensing_in_progress) {
-        ESP_LOGW(TAG, "Already dispensing, ignoring");
-        return;
-    }
-    s_dispensing_in_progress = true;
-
     /* Show guidance on LCD */
     if (s_lcd && s_lcd_mutex) {
         xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
@@ -299,17 +327,32 @@ static void dispense_medicine(const dose_t *dose)
     if (hand_detected) {
         /* 3. Rotate stepper by one chamber */
         stepper_motor_set_direction(true);
-        stepper_motor_rotate_steps(s_steps_per_chamber);
-        ESP_LOGI(TAG, "Dispensed %s", dose->medicine);
+        esp_err_t step_ret = stepper_motor_rotate_steps(s_steps_per_chamber);
+        if (step_ret != ESP_OK) {
+            ESP_LOGE(TAG, "Stepper failed while dispensing %s: %s",
+                     dose->medicine, esp_err_to_name(step_ret));
+            mqtt_manager_publish_log("error", dose->medicine,
+                                     dose->remaining_pills, "stepper failed");
+            if (s_lcd && s_lcd_mutex) {
+                xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
+                lcd_set_cursor(s_lcd, 2, 0);
+                lcd_printf(s_lcd, "Motor error       ");
+                lcd_set_cursor(s_lcd, 3, 0);
+                lcd_printf(s_lcd, "Dose not moved    ");
+                xSemaphoreGive(s_lcd_mutex);
+            }
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            return;
+        }
+
+        s_current_chamber = (s_current_chamber + 1) % CAROUSEL_CHAMBERS;
+        save_chamber_to_nvs();
+        ESP_LOGI(TAG, "Dispensed %s, next chamber=%u", dose->medicine, s_current_chamber);
 
         /* 4. Relock (placeholder) */
         ESP_LOGI(TAG, "Relocking bin");
 
         /* 5. Publish log via MQTT */
-        char timebuf[32];
-        time_t now_utc;
-        time_service_get_timestamp(&now_utc);
-        strftime(timebuf, sizeof(timebuf), "%Y-%m-%dT%H:%M:%SZ", gmtime(&now_utc));
         mqtt_manager_publish_log("dispensed", dose->medicine,
                                  dose->remaining_pills - 1, "auto");
 
@@ -337,7 +380,6 @@ static void dispense_medicine(const dose_t *dose)
             xSemaphoreGive(s_lcd_mutex);
         }
     }
-    s_dispensing_in_progress = false;
 
     /* Brief delay to let the user read the message, then restore normal display */
     vTaskDelay(pdMS_TO_TICKS(2000));
@@ -349,20 +391,84 @@ static void dispense_medicine(const dose_t *dose)
 static void check_timer_cb(void *arg)
 {
     (void)arg;
-    if (s_dose_count == 0) return;
-    if (s_dispensing_in_progress) return;
+    queue_next_dose_for_dispense(true);
+}
 
-    time_t now_utc;
-    time_service_get_timestamp(&now_utc);
-    /* Doses are sorted by time, the first one is the earliest */
-    if (now_utc >= s_doses[0].timestamp) {
-        dose_t dose = s_doses[0];
-        /* Remove this dose from the list */
-        for (int i = 0; i < s_dose_count - 1; i++) {
-            s_doses[i] = s_doses[i + 1];
+static bool pop_first_dose_locked(dose_t *dose)
+{
+    if (s_dose_count == 0 || dose == NULL) return false;
+
+    *dose = s_doses[0];
+    for (int i = 0; i < s_dose_count - 1; i++) {
+        s_doses[i] = s_doses[i + 1];
+    }
+    s_dose_count--;
+    return true;
+}
+
+static void restore_first_dose_locked(const dose_t *dose)
+{
+    if (dose == NULL || s_dose_count >= MAX_DOSES) return;
+
+    for (int i = s_dose_count; i > 0; i--) {
+        s_doses[i] = s_doses[i - 1];
+    }
+    s_doses[0] = *dose;
+    s_dose_count++;
+}
+
+static bool queue_next_dose_for_dispense(bool require_due_time)
+{
+    if (!s_scheduler_mutex || !s_dispense_queue) return false;
+
+    dose_t dose;
+    bool should_queue = false;
+
+    xSemaphoreTake(s_scheduler_mutex, portMAX_DELAY);
+    if (!s_dispensing_in_progress && s_dose_count > 0) {
+        if (!require_due_time) {
+            should_queue = true;
+        } else {
+            time_t now_utc;
+            time_service_get_timestamp(&now_utc);
+            should_queue = (now_utc >= s_doses[0].timestamp);
         }
-        s_dose_count--;
-        dispense_medicine(&dose);
+
+        if (should_queue) {
+            pop_first_dose_locked(&dose);
+            s_dispensing_in_progress = true;
+        }
+    }
+    xSemaphoreGive(s_scheduler_mutex);
+
+    if (!should_queue) return false;
+
+    if (xQueueSend(s_dispense_queue, &dose, 0) == pdTRUE) {
+        return true;
+    }
+
+    xSemaphoreTake(s_scheduler_mutex, portMAX_DELAY);
+    restore_first_dose_locked(&dose);
+    s_dispensing_in_progress = false;
+    xSemaphoreGive(s_scheduler_mutex);
+
+    ESP_LOGE(TAG, "Dispense queue full; dose restored");
+    return false;
+}
+
+static void dispense_task(void *arg)
+{
+    (void)arg;
+    dose_t dose;
+
+    while (1) {
+        if (xQueueReceive(s_dispense_queue, &dose, portMAX_DELAY) == pdTRUE) {
+            dispense_medicine(&dose);
+
+            xSemaphoreTake(s_scheduler_mutex, portMAX_DELAY);
+            s_dispensing_in_progress = false;
+            xSemaphoreGive(s_scheduler_mutex);
+        }
     }
 }
 
@@ -371,8 +477,24 @@ static void check_timer_cb(void *arg)
 /* ------------------------------------------------------------------------- */
 esp_err_t scheduler_init(uint32_t steps_per_chamber, uint32_t hand_wait_timeout_sec)
 {
+    if (steps_per_chamber == 0 || hand_wait_timeout_sec == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
     s_steps_per_chamber = steps_per_chamber;
     s_hand_wait_sec = hand_wait_timeout_sec;
+
+    s_scheduler_mutex = xSemaphoreCreateMutex();
+    if (!s_scheduler_mutex) return ESP_ERR_NO_MEM;
+
+    s_dispense_queue = xQueueCreate(1, sizeof(dose_t));
+    if (!s_dispense_queue) return ESP_ERR_NO_MEM;
+
+    if (xTaskCreate(dispense_task, "dispense_task", 4096, NULL, 5, NULL) != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    load_chamber_from_nvs();
 
     /* Load any previously saved schedule from NVS */
     char *saved_json = load_schedule_from_nvs();
@@ -392,8 +514,9 @@ esp_err_t scheduler_init(uint32_t steps_per_chamber, uint32_t hand_wait_timeout_
     esp_timer_start_periodic(s_check_timer, 60 * 1000000LL);
 
     s_initialized = true;
-    ESP_LOGI(TAG, "Scheduler initialized: %d pending doses, steps/chamber=%lu, hand wait=%lu sec",
-             s_dose_count, s_steps_per_chamber, s_hand_wait_sec);
+    ESP_LOGI(TAG, "Scheduler initialized: %d pending doses, steps/chamber=%lu, chamber=%u, hand wait=%lu sec",
+             s_dose_count, (unsigned long)s_steps_per_chamber, s_current_chamber,
+             (unsigned long)s_hand_wait_sec);
     return ESP_OK;
 }
 
@@ -401,11 +524,15 @@ esp_err_t scheduler_set_schedule(const char *schedule_json)
 {
     if (!schedule_json) return ESP_ERR_INVALID_ARG;
 
+    if (s_scheduler_mutex) xSemaphoreTake(s_scheduler_mutex, portMAX_DELAY);
+
     /* Clear existing schedule */
     s_dose_count = 0;
 
     /* Parse the new JSON and generate future doses */
     int count = generate_doses_from_json(schedule_json);
+    if (s_scheduler_mutex) xSemaphoreGive(s_scheduler_mutex);
+
     if (count == 0) {
         ESP_LOGW(TAG, "No future doses generated (all times are in the past)");
         /* Still consider the JSON valid – just no future doses */
@@ -421,7 +548,10 @@ esp_err_t scheduler_set_schedule(const char *schedule_json)
 
 void scheduler_clear(void)
 {
+    if (s_scheduler_mutex) xSemaphoreTake(s_scheduler_mutex, portMAX_DELAY);
     s_dose_count = 0;
+    if (s_scheduler_mutex) xSemaphoreGive(s_scheduler_mutex);
+
     nvs_handle_t nvs;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
         nvs_erase_key(nvs, NVS_KEY_SCHEDULE);
@@ -433,24 +563,46 @@ void scheduler_clear(void)
 
 void scheduler_dispense_now(void)
 {
-    if (s_dose_count == 0) {
+    if (!queue_next_dose_for_dispense(false)) {
         ESP_LOGW(TAG, "No pending doses to dispense");
-        return;
     }
+}
+
+void scheduler_calibration_move_steps(uint32_t steps)
+{
+    if (steps == 0) return;
+
+    if (s_scheduler_mutex) xSemaphoreTake(s_scheduler_mutex, portMAX_DELAY);
     if (s_dispensing_in_progress) {
-        ESP_LOGW(TAG, "Already dispensing, please wait");
+        if (s_scheduler_mutex) xSemaphoreGive(s_scheduler_mutex);
+        ESP_LOGW(TAG, "Calibration move ignored; dispensing is active");
         return;
     }
-    /* Take the first pending dose */
-    dose_t dose = s_doses[0];
-    for (int i = 0; i < s_dose_count - 1; i++) {
-        s_doses[i] = s_doses[i + 1];
+    s_dispensing_in_progress = true;
+    if (s_scheduler_mutex) xSemaphoreGive(s_scheduler_mutex);
+
+    ESP_LOGW(TAG, "Calibration move: %lu full steps", (unsigned long)steps);
+    stepper_motor_set_direction(true);
+    esp_err_t ret = stepper_motor_rotate_steps(steps);
+
+    if (ret == ESP_OK && steps == s_steps_per_chamber) {
+        s_current_chamber = (s_current_chamber + 1) % CAROUSEL_CHAMBERS;
+        save_chamber_to_nvs();
+        ESP_LOGI(TAG, "Calibration chamber advance complete, next chamber=%u", s_current_chamber);
+    } else if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Calibration move failed: %s", esp_err_to_name(ret));
     }
-    s_dose_count--;
-    dispense_medicine(&dose);
+
+    if (s_scheduler_mutex) xSemaphoreTake(s_scheduler_mutex, portMAX_DELAY);
+    s_dispensing_in_progress = false;
+    if (s_scheduler_mutex) xSemaphoreGive(s_scheduler_mutex);
 }
 
 int scheduler_get_pending_count(void)
 {
-    return s_dose_count;
+    int pending;
+    if (s_scheduler_mutex) xSemaphoreTake(s_scheduler_mutex, portMAX_DELAY);
+    pending = s_dose_count;
+    if (s_scheduler_mutex) xSemaphoreGive(s_scheduler_mutex);
+    return pending;
 }
