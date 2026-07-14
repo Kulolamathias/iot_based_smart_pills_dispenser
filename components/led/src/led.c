@@ -11,7 +11,7 @@ static const char *TAG = "RGB_LED";
 #define RGB_RED_CHANNEL     LEDC_CHANNEL_1
 #define RGB_GREEN_CHANNEL   LEDC_CHANNEL_2
 #define RGB_BLUE_CHANNEL    LEDC_CHANNEL_3
-#define RGB_YELLOW_RED_DUTY 410
+#define RGB_YELLOW_RED_DUTY 870
 
 static gpio_num_t s_red_pin;
 static gpio_num_t s_green_pin;
