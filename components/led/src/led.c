@@ -11,6 +11,7 @@ static const char *TAG = "RGB_LED";
 #define RGB_RED_CHANNEL     LEDC_CHANNEL_1
 #define RGB_GREEN_CHANNEL   LEDC_CHANNEL_2
 #define RGB_BLUE_CHANNEL    LEDC_CHANNEL_3
+#define RGB_YELLOW_RED_DUTY 410
 
 static gpio_num_t s_red_pin;
 static gpio_num_t s_green_pin;
@@ -97,8 +98,8 @@ void rgb_led_set(rgb_led_color_t color)
             red = RGB_LEDC_MAX_DUTY;
             break;
         case RGB_LED_YELLOW:
-            red = RGB_LEDC_MAX_DUTY;
-            green = 720;
+            red = RGB_YELLOW_RED_DUTY;
+            green = RGB_LEDC_MAX_DUTY;
             break;
         case RGB_LED_BLUE:
             blue = RGB_LEDC_MAX_DUTY;

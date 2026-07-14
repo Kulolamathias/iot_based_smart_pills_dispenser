@@ -18,5 +18,6 @@ idf_component_register(
         config 
         utils
         esp_timer
+        json
         esp_netif esp_event time_service
 )

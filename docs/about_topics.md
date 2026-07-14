@@ -4,6 +4,18 @@ smartpill/discovery/announce  ->  {"id":"e8f60a8b259c","type":"pill_dispenser"}
 // 2. Set schedule (backend sends)
 smartpill/dispenser/e8f60a8b259c/schedule  ->  [{"name":"Aspirin","times":["08:00","20:00"],"duration_days":3,"total_pills":6}]
 
+Optional quantity fields supported by the device:
+
+- `total_doses`: maximum number of dispensing occasions to generate.
+- `pills_per_dose`: number of pills consumed at each dispensing occasion.
+
+For example, 12 pills taken 2 at a time creates 6 dispensing occasions:
+
+[{"name":"Aspirin","times":["08:00","20:00"],"duration_days":4,"total_pills":12,"pills_per_dose":2,"total_doses":6}]
+
+Existing mobile payloads remain compatible. If `pills_per_dose` is omitted, it
+defaults to one pill per dispensing occasion.
+
 // 3. Command (backend sends)
 smartpill/dispenser/e8f60a8b259c/command  ->  {"action":"dispense_now"}
 

@@ -43,7 +43,9 @@ esp_err_t scheduler_init(uint32_t steps_per_chamber, uint32_t hand_wait_timeout_
 /**
  * @brief Set a new schedule from JSON (clears previous schedule)
  * 
- * @param schedule_json JSON array as defined in MQTT contract
+ * @param schedule_json JSON array as defined in the MQTT contract. Optional
+ *        total_doses and pills_per_dose fields limit generated dose events;
+ *        existing payloads default to one pill per dose.
  * @return ESP_OK if schedule accepted, else error
  */
 esp_err_t scheduler_set_schedule(const char *schedule_json);

@@ -12,6 +12,7 @@ static esp_timer_handle_t s_tick_timer = NULL;
 static bool s_initialized = false;
 static bool s_ntp_sync_in_progress = false;
 static volatile bool s_ntp_synchronized = false;
+static volatile bool s_time_valid = false;
 static time_service_sync_cb_t s_sync_cb = NULL;
 
 /* 1‑second timer callback – increments UTC timestamp */
@@ -27,6 +28,7 @@ static void ntp_sync_callback(struct timeval *tv)
     if (tv) {
         s_current_timestamp_utc = tv->tv_sec;
         s_ntp_synchronized = true;
+        s_time_valid = true;
         ESP_LOGI(TAG, "NTP sync successful, UTC time = %lld", (long long)s_current_timestamp_utc);
         if (s_sync_cb) {
             s_sync_cb();
@@ -104,8 +106,11 @@ esp_err_t time_service_get_tm(struct tm *tm)
 /* Set UTC timestamp directly */
 esp_err_t time_service_set_timestamp(time_t timestamp)
 {
+    if (!s_initialized || timestamp <= 0) return ESP_ERR_INVALID_ARG;
     s_current_timestamp_utc = timestamp;
-    ESP_LOGI(TAG, "UTC time manually set to %lld", (long long)timestamp);
+    s_time_valid = true;
+    ESP_LOGI(TAG, "UTC time manually set to %lld; clock is valid", (long long)timestamp);
+    if (s_sync_cb) s_sync_cb();
     return ESP_OK;
 }
 
@@ -118,7 +123,7 @@ void time_service_set_timezone(int hours)
 
 bool time_service_is_synchronized(void)
 {
-    return s_ntp_synchronized;
+    return s_time_valid;
 }
 
 void time_service_register_sync_cb(time_service_sync_cb_t cb)

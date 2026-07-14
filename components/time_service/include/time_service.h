@@ -25,8 +25,10 @@ esp_err_t time_service_sync_ntp(void);
 
 esp_err_t time_service_get_timestamp(time_t *timestamp);
 esp_err_t time_service_get_tm(struct tm *tm);                  // returns LOCAL time (with offset)
-esp_err_t time_service_set_timestamp(time_t timestamp);        // set UTC
+/** Set UTC manually and mark the software clock valid for offline scheduling. */
+esp_err_t time_service_set_timestamp(time_t timestamp);
 void time_service_set_timezone(int hours);                     // offset from UTC (e.g., +3 for Tanzania)
+/** True when time is valid from either manual entry or NTP synchronization. */
 bool time_service_is_synchronized(void);
 void time_service_register_sync_cb(time_service_sync_cb_t cb);
 

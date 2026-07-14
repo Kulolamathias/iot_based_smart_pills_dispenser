@@ -46,6 +46,7 @@ static const char *TAG = "SCHEDULER";
 
 /* Hand must be very close to the outlet before the carousel advances. */
 #define HAND_DETECT_CM  7.0f
+#define HAND_CONFIRMATION_MS 1000
 #define SCHEDULER_CHECK_INTERVAL_US 1000000LL
 #define CURRENT_MINUTE_GRACE_SEC 59
 #define SUCCESS_FEEDBACK_US 3000000LL
@@ -64,7 +65,7 @@ static uint8_t s_current_chamber = 0;
 typedef struct {
     time_t timestamp;           /* UTC timestamp of the dose */
     char medicine[32];          /* Medicine name */
-    int remaining_pills;        /* Pills left after this dose (or -1 unlimited) */
+    int remaining_pills;        /* Pills left after this dose (or -1 unknown) */
 } dose_t;
 
 typedef enum {
@@ -187,6 +188,7 @@ static void save_pending_doses_to_nvs(void)
         cJSON_AddNumberToObject(item, "timestamp", (double)s_doses[i].timestamp);
         cJSON_AddStringToObject(item, "medicine", s_doses[i].medicine);
         cJSON_AddNumberToObject(item, "remaining_pills", s_doses[i].remaining_pills);
+        cJSON_AddBoolToObject(item, "remaining_is_after", true);
         cJSON_AddItemToArray(root, item);
     }
 
@@ -240,12 +242,18 @@ static bool load_pending_doses_from_nvs(void)
         cJSON *timestamp = cJSON_GetObjectItem(item, "timestamp");
         cJSON *medicine = cJSON_GetObjectItem(item, "medicine");
         cJSON *remaining = cJSON_GetObjectItem(item, "remaining_pills");
+        cJSON *remaining_is_after = cJSON_GetObjectItem(item, "remaining_is_after");
 
         if (!cJSON_IsNumber(timestamp) || !cJSON_IsString(medicine)) continue;
 
         s_doses[loaded].timestamp = (time_t)timestamp->valuedouble;
         strlcpy(s_doses[loaded].medicine, medicine->valuestring, sizeof(s_doses[loaded].medicine));
         s_doses[loaded].remaining_pills = cJSON_IsNumber(remaining) ? remaining->valueint : -1;
+        if (s_doses[loaded].remaining_pills >= 0 && !cJSON_IsTrue(remaining_is_after)) {
+            /* Migrate pending events saved by firmware that stored the pre-dose count. */
+            s_doses[loaded].remaining_pills--;
+            if (s_doses[loaded].remaining_pills < 0) s_doses[loaded].remaining_pills = 0;
+        }
         loaded++;
     }
 
@@ -312,6 +320,8 @@ static int generate_doses_from_json(const char *json)
         cJSON *times = cJSON_GetObjectItem(entry, "times");
         cJSON *duration = cJSON_GetObjectItem(entry, "duration_days");
         cJSON *total_pills = cJSON_GetObjectItem(entry, "total_pills");
+        cJSON *total_doses = cJSON_GetObjectItem(entry, "total_doses");
+        cJSON *pills_per_dose = cJSON_GetObjectItem(entry, "pills_per_dose");
         cJSON *start_date = cJSON_GetObjectItem(entry, "start_date");
 
         if (!name || !cJSON_IsString(name) ||
@@ -323,7 +333,19 @@ static int generate_doses_from_json(const char *json)
 
         const char *med_name = name->valuestring;
         int duration_days = duration->valueint;
-        int pills_available = total_pills ? total_pills->valueint : -1;
+        int pills_available = cJSON_IsNumber(total_pills) ? total_pills->valueint : -1;
+        int pills_each_time = cJSON_IsNumber(pills_per_dose) ? pills_per_dose->valueint : 1;
+        int requested_doses = cJSON_IsNumber(total_doses) ? total_doses->valueint : -1;
+        int generated_for_entry = 0;
+
+        if (pills_each_time < 1) pills_each_time = 1;
+        if (pills_available == 0 || requested_doses == 0) {
+            ESP_LOGW(TAG, "Skipping schedule entry with zero available doses");
+            continue;
+        }
+        if (requested_doses < 0 && pills_available > 0) {
+            requested_doses = (pills_available + pills_each_time - 1) / pills_each_time;
+        }
 
         /* Determine start date (local) */
         int year = current_year, month = current_month, day = current_day;
@@ -352,6 +374,11 @@ static int generate_doses_from_json(const char *json)
             if (dose_year == current_year && dose_month == current_month && dose_day < current_day) continue;
 
             for (int t = 0; t < cJSON_GetArraySize(times); t++) {
+                if ((requested_doses > 0 && generated_for_entry >= requested_doses) ||
+                    pills_available == 0 || total >= MAX_DOSES) {
+                    break;
+                }
+
                 cJSON *time_str = cJSON_GetArrayItem(times, t);
                 if (!cJSON_IsString(time_str)) continue;
 
@@ -368,15 +395,22 @@ static int generate_doses_from_json(const char *json)
 
                 s_doses[total].timestamp = dose_utc;
                 strlcpy(s_doses[total].medicine, med_name, sizeof(s_doses[total].medicine));
-                s_doses[total].remaining_pills = pills_available;
-                total++;
-
                 if (pills_available > 0) {
-                    pills_available--;
-                    if (pills_available == 0) break;
+                    int pills_used = pills_available < pills_each_time
+                                         ? pills_available
+                                         : pills_each_time;
+                    pills_available -= pills_used;
+                    s_doses[total].remaining_pills = pills_available;
+                } else {
+                    s_doses[total].remaining_pills = -1;
                 }
+                total++;
+                generated_for_entry++;
             }
-            if (pills_available == 0) break;
+            if ((requested_doses > 0 && generated_for_entry >= requested_doses) ||
+                pills_available == 0 || total >= MAX_DOSES) {
+                break;
+            }
         }
     }
     cJSON_Delete(root);
@@ -415,6 +449,7 @@ static dispense_result_t dispense_medicine(const dose_t *dose)
     if (s_scheduler_mutex) xSemaphoreGive(s_scheduler_mutex);
 
     int64_t last_feedback_time = 0;
+    int64_t hand_detected_since_us = 0;
     while (true) {
         bool cancel_requested = false;
         if (s_scheduler_mutex) xSemaphoreTake(s_scheduler_mutex, portMAX_DELAY);
@@ -436,12 +471,23 @@ static dispense_result_t dispense_medicine(const dose_t *dose)
         if (s_scheduler_mutex) xSemaphoreTake(s_scheduler_mutex, portMAX_DELAY);
         s_hand_distance_cm = dist;
         if (s_scheduler_mutex) xSemaphoreGive(s_scheduler_mutex);
-        if (dist > 0.1f && dist <= HAND_DETECT_CM) {
-            ESP_LOGI(TAG, "Hand detected at %.1f cm", dist);
-            break;
-        }
 
         int64_t now_us = esp_timer_get_time();
+        if (dist > 0.1f && dist <= HAND_DETECT_CM) {
+            if (hand_detected_since_us == 0) {
+                hand_detected_since_us = now_us;
+                ESP_LOGI(TAG, "Hand detected at %.1f cm; hold steady for %d ms",
+                         dist, HAND_CONFIRMATION_MS);
+            } else if ((now_us - hand_detected_since_us) >=
+                       (HAND_CONFIRMATION_MS * 1000LL)) {
+                ESP_LOGI(TAG, "Hand position confirmed at %.1f cm; dispensing", dist);
+                break;
+            }
+        } else if (hand_detected_since_us != 0) {
+            ESP_LOGI(TAG, "Hand moved before confirmation; waiting again");
+            hand_detected_since_us = 0;
+        }
+
         if ((now_us - last_feedback_time) >= (s_hand_wait_sec * 1000000LL)) {
             last_feedback_time = now_us;
             if (dist > 0.1f) {
@@ -492,7 +538,7 @@ static dispense_result_t dispense_medicine(const dose_t *dose)
 
     ESP_LOGI(TAG, "Relocking bin");
     mqtt_manager_publish_log("dispensed", dose->medicine,
-                             dose->remaining_pills - 1, "auto");
+                             dose->remaining_pills, "auto");
 
     vTaskDelay(pdMS_TO_TICKS(2000));
     return DISPENSE_RESULT_SUCCESS;
