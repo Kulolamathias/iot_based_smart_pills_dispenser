@@ -3,4 +3,7 @@ idf_component_register(
         "src/buzzer.c"
     INCLUDE_DIRS 
         "include"
+    REQUIRES
+        driver
+        freertos
 )

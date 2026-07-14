@@ -2,11 +2,34 @@
 #define SCHEDULER_H
 
 #include "esp_err.h"
+#include <stdbool.h>
+#include <stdint.h>
 #include <time.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+#define SCHEDULER_MEDICINE_NAME_LEN 32
+
+typedef enum {
+    SCHEDULER_ACTIVITY_IDLE = 0,
+    SCHEDULER_ACTIVITY_WAITING_FOR_HAND,
+    SCHEDULER_ACTIVITY_DISPENSING,
+    SCHEDULER_ACTIVITY_SUCCESS,
+    SCHEDULER_ACTIVITY_ERROR
+} scheduler_activity_t;
+
+typedef struct {
+    scheduler_activity_t activity;
+    int pending_count;
+    bool has_next_dose;
+    time_t next_due_time;
+    char next_medicine[SCHEDULER_MEDICINE_NAME_LEN];
+    char active_medicine[SCHEDULER_MEDICINE_NAME_LEN];
+    float hand_distance_cm;
+    uint8_t current_chamber;
+} scheduler_status_t;
 
 /**
  * @brief Initialize the scheduler (load schedule from NVS, start checking timer)
@@ -52,6 +75,29 @@ void scheduler_calibration_move_steps(uint32_t steps);
  * @brief Get number of pending doses (not yet taken)
  */
 int scheduler_get_pending_count(void);
+
+/**
+ * @brief Get the timestamp of the next pending dose.
+ *
+ * @param timestamp Output UTC timestamp.
+ * @return true if a next dose exists.
+ */
+bool scheduler_get_next_due_time(time_t *timestamp);
+
+/**
+ * @brief Return true while a due dose is waiting for hand detection.
+ */
+bool scheduler_is_waiting_for_hand(void);
+
+/**
+ * @brief Return true briefly after a successful dispense for success feedback.
+ */
+bool scheduler_success_flash_active(void);
+
+/**
+ * @brief Get one coherent snapshot for alerts and the user interface.
+ */
+esp_err_t scheduler_get_status(scheduler_status_t *status);
 
 #ifdef __cplusplus
 }

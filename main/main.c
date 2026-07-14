@@ -28,6 +28,8 @@
 #include "ultrasonic.h"
 #include "stepper_motor.h"
 #include "keypad.h"
+#include "led.h"
+#include "buzzer.h"
 #include "wifi_manager.h"
 #include "mqtt_manager.h"
 #include "scheduler.h"
@@ -35,7 +37,7 @@
 static const char *TAG = "MAIN";
 
 /* ========================================================================= */
-/* Hardware pin definitions (adjust to your wiring)                         */
+/* Hardware pin definitions (adjust to your wiring)                       =  */
 /* ========================================================================= */
 #define I2C_MASTER_SCL_IO      6
 #define I2C_MASTER_SDA_IO      7
@@ -54,19 +56,42 @@ static const char *TAG = "MAIN";
 #define ENABLE_PIN              21
 #define STEP_DELAY_US           8000
 
+#define BUZZER_PIN              12
+#define RGB_LED_RED_PIN         15
+#define RGB_LED_GREEN_PIN       16
+#define RGB_LED_BLUE_PIN        17
+#define RGB_LED_ACTIVE_HIGH     false
+
 #define KEYPAD_ROW_PINS         {1, 2, 42, 41}
 #define KEYPAD_COL_PINS         {40, 39, 38, 3}
 
 #define WIFI_SSID               "Mathias' Sxx U..."
 #define WIFI_PASSWORD           "1234567890223"
+
+// #define WIFI_SSID               "chaz"
+// #define WIFI_PASSWORD           "0123456789"
+
+// #define WIFI_SSID              "Igman"
+// #define WIFI_PASSWORD           "igman_0123"
+
 #define MQTT_BROKER_URI         "mqtt://102.223.8.140:1883"
 #define MQTT_USERNAME           "mqtt_user"
 #define MQTT_PASSWORD           "ega12345"
 
-#define MOTOR_FULL_STEPS_PER_REV 200
-#define CAROUSEL_CHAMBERS       20
-#define STEPS_PER_CHAMBER       (MOTOR_FULL_STEPS_PER_REV / CAROUSEL_CHAMBERS)
+#define MOTOR_FULL_STEPS_PER_REV       200
+/* A4988 is wired for full-step mode: one STEP pulse is one motor full step. */
+#define MOTOR_EFFECTIVE_STEPS_PER_REV  MOTOR_FULL_STEPS_PER_REV
+#define CAROUSEL_CHAMBERS              20
+#define STEPS_PER_CHAMBER              (MOTOR_EFFECTIVE_STEPS_PER_REV / CAROUSEL_CHAMBERS)
+
+_Static_assert((MOTOR_EFFECTIVE_STEPS_PER_REV % CAROUSEL_CHAMBERS) == 0,
+               "Carousel pulses per revolution must divide evenly by chamber count");
 #define HAND_WAIT_REMINDER_SEC  10       /* LCD/log reminder interval while waiting for hand */
+#define DOSE_NEAR_WINDOW_SEC    (2 * 60)
+#define NEAR_BUZZ_INTERVAL_SEC  20
+#define DUE_BUZZ_INTERVAL_SEC   10
+#define LOCAL_TIME_OFFSET_SEC   (3 * 3600)
+#define LCD_NOTICE_DURATION_MS  2500
 
 /* ========================================================================= */
 /* Global variables used by scheduler                                       */
@@ -74,9 +99,41 @@ static const char *TAG = "MAIN";
 lcd_handle_t *s_lcd = NULL;
 SemaphoreHandle_t s_lcd_mutex = NULL;
 
-static float s_last_distance = -1.0f;
-static char s_last_time_str[20] = "";
-static int s_last_second = -1;
+static int64_t s_last_near_buzz_us = 0;
+static int64_t s_last_due_buzz_us = 0;
+static bool s_output_test_active = false;
+static bool s_mqtt_started = false;
+static rgb_led_color_t s_last_alert_color = RGB_LED_OFF;
+static char s_lcd_cache[LCD_ROWS][LCD_COLS + 1] = {{0}};
+static bool s_lcd_cache_valid = false;
+static char s_notice_lines[LCD_ROWS][LCD_COLS + 1] = {{0}};
+static int64_t s_notice_until_us = 0;
+
+static const char *alert_color_name(rgb_led_color_t color)
+{
+    switch (color) {
+        case RGB_LED_GREEN: return "green";
+        case RGB_LED_RED: return "red";
+        case RGB_LED_YELLOW: return "yellow";
+        case RGB_LED_BLUE: return "blue";
+        case RGB_LED_CYAN: return "cyan";
+        case RGB_LED_IDLE: return "idle-white";
+        case RGB_LED_WHITE: return "white";
+        case RGB_LED_OFF:
+        default: return "off";
+    }
+}
+
+static bool set_alert_color(rgb_led_color_t color, const char *reason)
+{
+    bool changed = s_last_alert_color != color;
+    rgb_led_set(color);
+    if (changed) {
+        s_last_alert_color = color;
+        ESP_LOGI(TAG, "RGB alert: %s (%s)", alert_color_name(color), reason);
+    }
+    return changed;
+}
 
 typedef enum {
     LOCAL_UI_IDLE = 0,
@@ -102,26 +159,64 @@ static local_schedule_ui_t s_local_ui = {
     .state = LOCAL_UI_IDLE
 };
 
-/* ========================================================================= */
-/* Helper: update LCD time (only when second changes)                       */
-/* ========================================================================= */
-static void update_lcd_time(void)
+static void copy_lcd_text(char destination[LCD_COLS + 1], const char *text)
 {
-    struct tm now;
-    time_service_get_tm(&now);   /* Returns local time (Tanzania, UTC+3) */
-    int current_second = now.tm_sec;
-    if (current_second != s_last_second) {
-        s_last_second = current_second;
-        char time_str[20];
-        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &now);
-        if (strcmp(time_str, s_last_time_str) != 0) {
-            strcpy(s_last_time_str, time_str);
-            xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
-            lcd_set_cursor(s_lcd, 0, 0);
-            lcd_printf(s_lcd, "%s", time_str);
-            xSemaphoreGive(s_lcd_mutex);
+    snprintf(destination, LCD_COLS + 1, "%-20.20s", text ? text : "");
+}
+
+static void format_local_due_time(time_t utc_timestamp, char *buffer, size_t buffer_size)
+{
+    struct tm local_due;
+    time_t local_timestamp = utc_timestamp + LOCAL_TIME_OFFSET_SEC;
+    gmtime_r(&local_timestamp, &local_due);
+    strftime(buffer, buffer_size, "%H:%M", &local_due);
+}
+
+static void show_lcd_notice(const char *line0, const char *line1,
+                            const char *line2, const char *line3)
+{
+    if (!s_lcd_mutex) return;
+
+    xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
+    copy_lcd_text(s_notice_lines[0], line0);
+    copy_lcd_text(s_notice_lines[1], line1);
+    copy_lcd_text(s_notice_lines[2], line2);
+    copy_lcd_text(s_notice_lines[3], line3);
+    s_notice_until_us = esp_timer_get_time() + (LCD_NOTICE_DURATION_MS * 1000LL);
+    s_lcd_cache_valid = false;
+    xSemaphoreGive(s_lcd_mutex);
+}
+
+static bool get_lcd_notice(char lines[LCD_ROWS][LCD_COLS + 1])
+{
+    bool active = false;
+    if (!s_lcd_mutex) return false;
+
+    xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
+    if (esp_timer_get_time() < s_notice_until_us) {
+        memcpy(lines, s_notice_lines, sizeof(s_notice_lines));
+        active = true;
+    } else {
+        s_notice_until_us = 0;
+    }
+    xSemaphoreGive(s_lcd_mutex);
+    return active;
+}
+
+static void render_lcd_screen(char lines[LCD_ROWS][LCD_COLS + 1])
+{
+    if (!s_lcd || !s_lcd_mutex) return;
+
+    xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
+    for (uint8_t row = 0; row < LCD_ROWS; row++) {
+        if (!s_lcd_cache_valid || strcmp(s_lcd_cache[row], lines[row]) != 0) {
+            lcd_set_cursor(s_lcd, row, 0);
+            lcd_printf(s_lcd, "%s", lines[row]);
+            strlcpy(s_lcd_cache[row], lines[row], sizeof(s_lcd_cache[row]));
         }
     }
+    s_lcd_cache_valid = true;
+    xSemaphoreGive(s_lcd_mutex);
 }
 
 static void lcd_line(uint8_t row, const char *text)
@@ -131,6 +226,7 @@ static void lcd_line(uint8_t row, const char *text)
     xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
     lcd_set_cursor(s_lcd, row, 0);
     lcd_printf(s_lcd, "%-20.20s", text);
+    s_lcd_cache_valid = false;
     xSemaphoreGive(s_lcd_mutex);
 }
 
@@ -230,6 +326,14 @@ static void local_ui_save_schedule(void)
     struct tm now;
     char json[192];
     esp_err_t ret;
+
+    if (!time_service_is_synchronized()) {
+        lcd_line(0, "Clock not ready");
+        lcd_line(1, "Waiting for time sync");
+        lcd_line(2, "Please try again");
+        lcd_line(3, "B=Back *=Cancel");
+        return;
+    }
 
     time_service_get_tm(&now);
     snprintf(json, sizeof(json),
@@ -363,27 +467,187 @@ static bool local_ui_active(void)
     return s_local_ui.state != LOCAL_UI_IDLE;
 }
 
-/* ========================================================================= */
-/* Distance measurement callback (called by timer every 2 seconds)          */
-/* ========================================================================= */
-static void distance_measure_cb(void *arg)
+static void update_lcd_dashboard(void)
 {
-    (void)arg;
-    if (local_ui_active()) return;
+    scheduler_status_t status;
+    char raw[LCD_ROWS][48] = {{0}};
+    char lines[LCD_ROWS][LCD_COLS + 1] = {{0}};
 
-    float dist = ultrasonic_measure_blocking();
-    if (dist != s_last_distance) {
-        s_last_distance = dist;
-        xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
-        lcd_set_cursor(s_lcd, 2, 0);
-        if (dist > 0.1f) {
-            lcd_printf(s_lcd, "Distance: %.1f cm   ", dist);
-        } else {
-            lcd_printf(s_lcd, "Distance: out of range");
-        }
-        xSemaphoreGive(s_lcd_mutex);
-        ESP_LOGI(TAG, "Distance: %.1f cm", dist);
+    if (scheduler_get_status(&status) != ESP_OK) return;
+
+    switch (status.activity) {
+        case SCHEDULER_ACTIVITY_WAITING_FOR_HAND:
+            snprintf(raw[0], sizeof(raw[0]), "DOSE READY NOW");
+            snprintf(raw[1], sizeof(raw[1]), "%.31s", status.active_medicine);
+            snprintf(raw[2], sizeof(raw[2]), "Place hand at outlet");
+            if (status.hand_distance_cm > 7.0f) {
+                snprintf(raw[3], sizeof(raw[3]), "Move closer: %.1f cm", status.hand_distance_cm);
+            } else if (status.hand_distance_cm > 0.1f) {
+                snprintf(raw[3], sizeof(raw[3]), "Hand detected");
+            } else {
+                snprintf(raw[3], sizeof(raw[3]), "Hold within 7 cm");
+            }
+            break;
+
+        case SCHEDULER_ACTIVITY_DISPENSING:
+            snprintf(raw[0], sizeof(raw[0]), "Dispensing medicine");
+            snprintf(raw[1], sizeof(raw[1]), "%.31s", status.active_medicine);
+            snprintf(raw[2], sizeof(raw[2]), "Please wait...");
+            break;
+
+        case SCHEDULER_ACTIVITY_SUCCESS:
+            snprintf(raw[0], sizeof(raw[0]), "Dose dispensed");
+            snprintf(raw[1], sizeof(raw[1]), "%.31s", status.active_medicine);
+            snprintf(raw[2], sizeof(raw[2]), "Please take it now");
+            snprintf(raw[3], sizeof(raw[3]), "Thank you");
+            break;
+
+        case SCHEDULER_ACTIVITY_ERROR:
+            snprintf(raw[0], sizeof(raw[0]), "Dose not released");
+            snprintf(raw[1], sizeof(raw[1]), "%.31s", status.active_medicine);
+            snprintf(raw[2], sizeof(raw[2]), "Please seek help");
+            snprintf(raw[3], sizeof(raw[3]), "Dose remains pending");
+            break;
+
+        case SCHEDULER_ACTIVITY_IDLE:
+        default:
+            break;
     }
+
+    if (status.activity == SCHEDULER_ACTIVITY_IDLE && get_lcd_notice(lines)) {
+        render_lcd_screen(lines);
+        return;
+    }
+
+    if (status.activity == SCHEDULER_ACTIVITY_IDLE && !time_service_is_synchronized()) {
+        snprintf(raw[0], sizeof(raw[0]), "Pill Dispenser");
+        snprintf(raw[1], sizeof(raw[1]), "Setting clock...");
+        snprintf(raw[2], sizeof(raw[2]), "Connecting service");
+        snprintf(raw[3], sizeof(raw[3]), "Please wait");
+    } else if (status.activity == SCHEDULER_ACTIVITY_IDLE) {
+        struct tm now;
+        time_t now_utc = 0;
+        char due_time[8] = "";
+
+        time_service_get_tm(&now);
+        time_service_get_timestamp(&now_utc);
+        strftime(raw[0], sizeof(raw[0]), "%d/%m/%Y %H:%M:%S", &now);
+
+        if (!status.has_next_dose) {
+            snprintf(raw[1], sizeof(raw[1]), "System ready");
+            snprintf(raw[2], sizeof(raw[2]), "No doses scheduled");
+            snprintf(raw[3], sizeof(raw[3]), "Press D to add dose");
+        } else {
+            int64_t seconds_to_due = (int64_t)(status.next_due_time - now_utc);
+            format_local_due_time(status.next_due_time, due_time, sizeof(due_time));
+
+            if (seconds_to_due <= 0) {
+                snprintf(raw[1], sizeof(raw[1]), "Dose is due now");
+                snprintf(raw[2], sizeof(raw[2]), "%.31s", status.next_medicine);
+                snprintf(raw[3], sizeof(raw[3]), "Preparing dispenser");
+            } else if (seconds_to_due <= DOSE_NEAR_WINDOW_SEC) {
+                long minutes = (long)(seconds_to_due / 60);
+                long seconds = (long)(seconds_to_due % 60);
+                snprintf(raw[1], sizeof(raw[1]), "Dose in %02ld:%02ld", minutes, seconds);
+                snprintf(raw[2], sizeof(raw[2]), "%.11s at %s", status.next_medicine, due_time);
+                snprintf(raw[3], sizeof(raw[3]), "Please stay nearby");
+            } else {
+                snprintf(raw[1], sizeof(raw[1]), "Next dose at %s", due_time);
+                snprintf(raw[2], sizeof(raw[2]), "%.31s", status.next_medicine);
+                snprintf(raw[3], sizeof(raw[3]), "%d dose%s remaining",
+                         status.pending_count, status.pending_count == 1 ? "" : "s");
+            }
+        }
+    }
+
+    for (uint8_t row = 0; row < LCD_ROWS; row++) {
+        copy_lcd_text(lines[row], raw[row]);
+    }
+    render_lcd_screen(lines);
+}
+
+static void update_alert_outputs(void)
+{
+    scheduler_status_t status;
+    time_t now_utc = 0;
+    int64_t now_us = esp_timer_get_time();
+    bool changed;
+
+    if (s_output_test_active) return;
+    if (scheduler_get_status(&status) != ESP_OK) return;
+
+    if (status.activity == SCHEDULER_ACTIVITY_SUCCESS) {
+        set_alert_color(RGB_LED_BLUE, "dispense success");
+        return;
+    }
+
+    if (status.activity == SCHEDULER_ACTIVITY_WAITING_FOR_HAND ||
+        status.activity == SCHEDULER_ACTIVITY_DISPENSING) {
+        changed = set_alert_color(RGB_LED_RED, "dose due");
+        if (changed || (now_us - s_last_due_buzz_us) >= (DUE_BUZZ_INTERVAL_SEC * 1000000LL)) {
+            s_last_due_buzz_us = now_us;
+            buzzer_due_alert();
+        }
+        return;
+    }
+
+    if (status.activity == SCHEDULER_ACTIVITY_ERROR) {
+        changed = set_alert_color(RGB_LED_RED, "dispense error");
+        if (changed) {
+            s_last_due_buzz_us = now_us;
+            buzzer_due_alert();
+        }
+        return;
+    }
+
+    if (!time_service_is_synchronized()) {
+        set_alert_color(RGB_LED_IDLE, "waiting for synchronized time");
+        return;
+    }
+
+    if (!status.has_next_dose) {
+        set_alert_color(RGB_LED_IDLE, "no pending schedule");
+        return;
+    }
+
+    time_service_get_timestamp(&now_utc);
+    int64_t seconds_to_due = (int64_t)(status.next_due_time - now_utc);
+
+    if (seconds_to_due <= 0) {
+        changed = set_alert_color(RGB_LED_RED, "dose time reached");
+        if (changed || (now_us - s_last_due_buzz_us) >= (DUE_BUZZ_INTERVAL_SEC * 1000000LL)) {
+            s_last_due_buzz_us = now_us;
+            buzzer_due_alert();
+        }
+    } else if (seconds_to_due <= DOSE_NEAR_WINDOW_SEC) {
+        changed = set_alert_color(RGB_LED_YELLOW, "dose time near");
+        if (changed || (now_us - s_last_near_buzz_us) >= (NEAR_BUZZ_INTERVAL_SEC * 1000000LL)) {
+            s_last_near_buzz_us = now_us;
+            buzzer_near_alert();
+        }
+    } else {
+        set_alert_color(RGB_LED_GREEN, "pending future schedule");
+    }
+}
+
+static void alert_self_test(void)
+{
+    ESP_LOGI(TAG, "Running alert self-test");
+    s_output_test_active = true;
+    rgb_led_set(RGB_LED_RED);
+    buzzer_tone(1800, 120);
+    vTaskDelay(pdMS_TO_TICKS(900));
+    rgb_led_set(RGB_LED_GREEN);
+    buzzer_tone(2200, 120);
+    vTaskDelay(pdMS_TO_TICKS(900));
+    rgb_led_set(RGB_LED_BLUE);
+    buzzer_tone(2600, 120);
+    vTaskDelay(pdMS_TO_TICKS(900));
+    rgb_led_set(RGB_LED_YELLOW);
+    vTaskDelay(pdMS_TO_TICKS(900));
+    rgb_led_set(RGB_LED_WHITE);
+    vTaskDelay(pdMS_TO_TICKS(900));
+    s_output_test_active = false;
 }
 
 /* ========================================================================= */
@@ -398,7 +662,7 @@ static void mqtt_command_cb(const char *action, const char *payload, void *user_
     } else if (strcmp(action, "advance_chamber") == 0) {
         scheduler_calibration_move_steps(STEPS_PER_CHAMBER);
     } else if (strcmp(action, "motor_rev_test") == 0) {
-        scheduler_calibration_move_steps(MOTOR_FULL_STEPS_PER_REV);
+        scheduler_calibration_move_steps(MOTOR_EFFECTIVE_STEPS_PER_REV);
     } else if (strcmp(action, "reboot") == 0) {
         ESP_LOGI(TAG, "Rebooting in 1 second...");
         vTaskDelay(pdMS_TO_TICKS(1000));
@@ -406,6 +670,7 @@ static void mqtt_command_cb(const char *action, const char *payload, void *user_
     } else if (strcmp(action, "clear_schedule") == 0) {
         scheduler_clear();
         mqtt_manager_publish_log("schedule_updated", NULL, -1, "cleared by command");
+        show_lcd_notice("Schedule cleared", "No doses pending", "", "");
     } else {
         ESP_LOGW(TAG, "Unknown action: %s", action);
     }
@@ -417,21 +682,35 @@ static void mqtt_schedule_cb(const char *schedule_json, void *user_data)
     ESP_LOGI(TAG, "New schedule received");
     esp_err_t ret = scheduler_set_schedule(schedule_json);
     if (ret == ESP_OK) {
+        scheduler_status_t status;
+        char next_line[32] = "Schedule is active";
+        char count_line[32] = "";
+        const char *medicine = "";
+
+        scheduler_get_status(&status);
+        if (status.has_next_dose) {
+            char due_time[8];
+            format_local_due_time(status.next_due_time, due_time, sizeof(due_time));
+            snprintf(next_line, sizeof(next_line), "Next dose: %s", due_time);
+            medicine = status.next_medicine;
+        } else if (status.activity == SCHEDULER_ACTIVITY_WAITING_FOR_HAND) {
+            snprintf(next_line, sizeof(next_line), "Dose is due now");
+            medicine = status.active_medicine;
+        }
+        snprintf(count_line, sizeof(count_line), "%d dose%s planned",
+                 status.pending_count, status.pending_count == 1 ? "" : "s");
+
         mqtt_manager_publish_log("schedule_updated", NULL, -1, "schedule stored");
-        /* Show confirmation on LCD */
-        xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
-        lcd_set_cursor(s_lcd, 3, 0);
-        lcd_printf(s_lcd, "Schedule updated ");
-        xSemaphoreGive(s_lcd_mutex);
-        vTaskDelay(pdMS_TO_TICKS(1500));
+        show_lcd_notice("Schedule saved", next_line, medicine, count_line);
     } else {
         ESP_LOGE(TAG, "Failed to set schedule");
-        mqtt_manager_publish_log("error", NULL, -1, "invalid schedule JSON");
-        xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
-        lcd_set_cursor(s_lcd, 3, 0);
-        lcd_printf(s_lcd, "Invalid schedule ");
-        xSemaphoreGive(s_lcd_mutex);
-        vTaskDelay(pdMS_TO_TICKS(1500));
+        if (ret == ESP_ERR_NOT_FOUND) {
+            mqtt_manager_publish_log("error", NULL, -1, "no future dose times");
+            show_lcd_notice("Schedule not saved", "No future dose times", "Check date and time", "Try again");
+        } else {
+            mqtt_manager_publish_log("error", NULL, -1, "invalid schedule JSON");
+            show_lcd_notice("Schedule not saved", "Invalid schedule", "Check app details", "Try again");
+        }
     }
 }
 
@@ -441,11 +720,33 @@ static void mqtt_connected_cb(void)
     mqtt_manager_publish_status("online");
 }
 
+static void start_mqtt_once(void)
+{
+    if (s_mqtt_started) return;
+
+    esp_err_t ret = mqtt_manager_start();
+    if (ret == ESP_OK) {
+        s_mqtt_started = true;
+        ESP_LOGI(TAG, "MQTT started after clock synchronization");
+    } else {
+        ESP_LOGE(TAG, "MQTT start failed: %s", esp_err_to_name(ret));
+    }
+}
+
+static void time_synchronized_cb(void)
+{
+    ESP_LOGI(TAG, "Clock synchronized; MQTT schedules can now be accepted safely");
+    start_mqtt_once();
+}
+
 static void wifi_connected_cb(void)
 {
-    ESP_LOGI(TAG, "WiFi connected, starting MQTT and NTP sync");
-    mqtt_manager_start();
-    time_service_sync_ntp();
+    ESP_LOGI(TAG, "WiFi connected, synchronizing clock");
+    if (time_service_is_synchronized()) {
+        start_mqtt_once();
+    } else {
+        time_service_sync_ntp();
+    }
 }
 
 /* ========================================================================= */
@@ -476,14 +777,9 @@ void app_main(void)
 
     /* 2. Software RTC (UTC) with Tanzania timezone (UTC+3) */
     ESP_ERROR_CHECK(time_service_init());
-    time_service_set_timezone(3);   /* Tanzania */
-    struct tm init_tm = {
-        .tm_year = 126, .tm_mon = 4, .tm_mday = 20,
-        .tm_hour = 12, .tm_min = 0, .tm_sec = 0
-    };
-    time_t init_ts = mktime(&init_tm);
-    time_service_set_timestamp(init_ts);
-    ESP_LOGI(TAG, "Software RTC initialised (UTC+3 display)");
+    time_service_set_timezone(3);
+    time_service_register_sync_cb(time_synchronized_cb);
+    ESP_LOGI(TAG, "Software clock initialised; waiting for NTP");
 
     /* 3. LCD */
     lcd_config_t lcd_cfg = {
@@ -505,16 +801,20 @@ void app_main(void)
     lcd_set_cursor(s_lcd, 1, 0);
     lcd_printf(s_lcd, "System Ready");
 
+    /* 3b. Alert outputs */
+    ESP_ERROR_CHECK(rgb_led_init(RGB_LED_RED_PIN,
+                                 RGB_LED_GREEN_PIN,
+                                 RGB_LED_BLUE_PIN,
+                                 RGB_LED_ACTIVE_HIGH));
+    ESP_ERROR_CHECK(buzzer_init(BUZZER_PIN));
+    rgb_led_set(RGB_LED_WHITE);
+    ESP_LOGI(TAG, "Alerts initialised: buzzer GPIO%d, RGB R=%d G=%d B=%d",
+             BUZZER_PIN, RGB_LED_RED_PIN, RGB_LED_GREEN_PIN, RGB_LED_BLUE_PIN);
+    buzzer_tone(2200, 120);
+
     /* 4. Ultrasonic sensor */
     ESP_ERROR_CHECK(ultrasonic_init(ULTRASONIC_TRIG_PIN, ULTRASONIC_ECHO_PIN, ULTRASONIC_TIMEOUT_US));
-    const esp_timer_create_args_t timer_args = {
-        .callback = distance_measure_cb,
-        .name = "dist_timer"
-    };
-    esp_timer_handle_t dist_timer;
-    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &dist_timer));
-    ESP_ERROR_CHECK(esp_timer_start_periodic(dist_timer, 2 * 1000 * 1000));
-    ESP_LOGI(TAG, "Ultrasonic started");
+    ESP_LOGI(TAG, "Ultrasonic ready for due-dose hand detection");
 
     /* 5. Stepper motor */
     stepper_config_t stepper_cfg = {
@@ -525,8 +825,10 @@ void app_main(void)
         .enable_on_init = false
     };
     ESP_ERROR_CHECK(stepper_motor_init(&stepper_cfg));
-    ESP_LOGI(TAG, "Stepper motor initialised: %d full steps/rev, %d chambers, %d steps/chamber",
-             MOTOR_FULL_STEPS_PER_REV, CAROUSEL_CHAMBERS, STEPS_PER_CHAMBER);
+    ESP_LOGI(TAG,
+             "Stepper motor initialised: motor=%d full steps/rev, effective=%d pulses/rev, %d chambers, %d pulses/chamber",
+             MOTOR_FULL_STEPS_PER_REV, MOTOR_EFFECTIVE_STEPS_PER_REV,
+             CAROUSEL_CHAMBERS, STEPS_PER_CHAMBER);
 
     /* 6. Keypad */
     gpio_num_t row_pins[4] = KEYPAD_ROW_PINS;
@@ -535,22 +837,23 @@ void app_main(void)
     ESP_ERROR_CHECK(keypad_start());
     ESP_LOGI(TAG, "Keypad initialised");
 
-    /* 7. WiFi & MQTT */
-    ESP_ERROR_CHECK(wifi_manager_init(WIFI_SSID, WIFI_PASSWORD));
-    wifi_manager_register_connected_cb(wifi_connected_cb);
-    wifi_manager_start();
-
+    /* 7. MQTT callbacks are ready before networking can deliver messages. */
     ESP_ERROR_CHECK(mqtt_manager_init(MQTT_BROKER_URI, MQTT_USERNAME, MQTT_PASSWORD));
     mqtt_manager_register_connected_cb(mqtt_connected_cb);
     mqtt_manager_register_command_cb(mqtt_command_cb, NULL);
     mqtt_manager_register_schedule_cb(mqtt_schedule_cb, NULL);
 
-    /* 8. Scheduler */
+    /* 8. Scheduler is ready before retained MQTT schedules can arrive. */
     ESP_ERROR_CHECK(scheduler_init(STEPS_PER_CHAMBER, HAND_WAIT_REMINDER_SEC));
     ESP_LOGI(TAG, "Scheduler initialised: %d steps/chamber, %d sec hand reminder",
              STEPS_PER_CHAMBER, HAND_WAIT_REMINDER_SEC);
 
-    /* 9. Main loop */
+    /* 9. Start WiFi. MQTT starts only after NTP confirms valid time. */
+    ESP_ERROR_CHECK(wifi_manager_init(WIFI_SSID, WIFI_PASSWORD));
+    wifi_manager_register_connected_cb(wifi_connected_cb);
+    ESP_ERROR_CHECK(wifi_manager_start());
+
+    /* 10. Main loop */
     char key;
     while (1) {
         if (s_local_ui.state == LOCAL_UI_DONE) {
@@ -558,22 +861,14 @@ void app_main(void)
                 s_local_ui.message_ticks--;
             } else {
                 memset(&s_local_ui, 0, sizeof(s_local_ui));
-                lcd_clear(s_lcd);
-                lcd_printf(s_lcd, "Pill Dispenser");
-                lcd_set_cursor(s_lcd, 1, 0);
-                lcd_printf(s_lcd, "System Ready");
+                s_lcd_cache_valid = false;
             }
         }
 
-        if (!local_ui_active()) {
-            update_lcd_time();
+        update_alert_outputs();
 
-            /* Update pending dose count on LCD line 3 */
-            int pending = scheduler_get_pending_count();
-            xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
-            lcd_set_cursor(s_lcd, 3, 0);
-            lcd_printf(s_lcd, "Pending: %d    ", pending);
-            xSemaphoreGive(s_lcd_mutex);
+        if (!local_ui_active()) {
+            update_lcd_dashboard();
         }
 
         /* Check for keypad input */
@@ -585,21 +880,16 @@ void app_main(void)
                 continue;
             }
 
-            /* Show key momentarily */
-            xSemaphoreTake(s_lcd_mutex, portMAX_DELAY);
-            lcd_set_cursor(s_lcd, 3, 0);
-            lcd_printf(s_lcd, "Key: %c          ", key);
-            xSemaphoreGive(s_lcd_mutex);
-            vTaskDelay(pdMS_TO_TICKS(500));
-
             if (key == 'A') {
                 scheduler_dispense_now();
             } else if (key == 'B') {
                 scheduler_calibration_move_steps(STEPS_PER_CHAMBER);
             } else if (key == 'C') {
-                scheduler_calibration_move_steps(MOTOR_FULL_STEPS_PER_REV);
+                scheduler_calibration_move_steps(MOTOR_EFFECTIVE_STEPS_PER_REV);
             } else if (key == 'D') {
                 local_ui_start();
+            } else if (key == '#') {
+                alert_self_test();
             }
         }
 

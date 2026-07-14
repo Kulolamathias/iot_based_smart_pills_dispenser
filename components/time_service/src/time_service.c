@@ -11,6 +11,8 @@ static int s_timezone_offset_seconds = 0;      // offset to add for local time
 static esp_timer_handle_t s_tick_timer = NULL;
 static bool s_initialized = false;
 static bool s_ntp_sync_in_progress = false;
+static volatile bool s_ntp_synchronized = false;
+static time_service_sync_cb_t s_sync_cb = NULL;
 
 /* 1‑second timer callback – increments UTC timestamp */
 static void tick_callback(void *arg)
@@ -24,7 +26,11 @@ static void ntp_sync_callback(struct timeval *tv)
 {
     if (tv) {
         s_current_timestamp_utc = tv->tv_sec;
+        s_ntp_synchronized = true;
         ESP_LOGI(TAG, "NTP sync successful, UTC time = %lld", (long long)s_current_timestamp_utc);
+        if (s_sync_cb) {
+            s_sync_cb();
+        }
     } else {
         ESP_LOGW(TAG, "NTP sync failed");
     }
@@ -64,15 +70,16 @@ esp_err_t time_service_init(void)
 esp_err_t time_service_sync_ntp(void)
 {
     if (!s_initialized) return ESP_ERR_INVALID_STATE;
+    if (s_ntp_synchronized) return ESP_OK;
     if (s_ntp_sync_in_progress) return ESP_OK;
 
     esp_sntp_stop();
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, "pool.ntp.org");
     esp_sntp_set_time_sync_notification_cb(ntp_sync_callback);
+    s_ntp_sync_in_progress = true;
     esp_sntp_init();
 
-    s_ntp_sync_in_progress = true;
     ESP_LOGI(TAG, "NTP sync started");
     return ESP_OK;
 }
@@ -90,7 +97,7 @@ esp_err_t time_service_get_tm(struct tm *tm)
 {
     if (!tm) return ESP_ERR_INVALID_ARG;
     time_t local_sec = s_current_timestamp_utc + s_timezone_offset_seconds;
-    localtime_r(&local_sec, tm);
+    gmtime_r(&local_sec, tm);
     return ESP_OK;
 }
 
@@ -107,4 +114,14 @@ void time_service_set_timezone(int hours)
 {
     s_timezone_offset_seconds = hours * 3600;
     ESP_LOGI(TAG, "Timezone offset set to %+d hours (UTC%+d)", hours, hours);
+}
+
+bool time_service_is_synchronized(void)
+{
+    return s_ntp_synchronized;
+}
+
+void time_service_register_sync_cb(time_service_sync_cb_t cb)
+{
+    s_sync_cb = cb;
 }

@@ -7,4 +7,5 @@ idf_component_register(
         config 
         utils
         driver
+        esp_timer
 )
